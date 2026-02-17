@@ -24,6 +24,7 @@ class MemberInfo:
     offset: Optional[int]
     bit_size: Optional[int]
     bit_offset: Optional[int]
+    alignment: Optional[int] = None
 
 
 @dataclass

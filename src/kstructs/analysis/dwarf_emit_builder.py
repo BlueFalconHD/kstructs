@@ -444,6 +444,9 @@ class TypeBuilder:
             bit_offset = _attr_int(child.attributes.get("DW_AT_data_bit_offset"))
             if bit_offset is None:
                 bit_offset = _attr_int(child.attributes.get("DW_AT_bit_offset"))
+            alignment = _attr_int(child.attributes.get("DW_AT_alignment"))
+            if alignment is not None and alignment <= 1:
+                alignment = None
 
             decl.members.append(
                 MemberInfo(
@@ -452,6 +455,7 @@ class TypeBuilder:
                     offset=offset,
                     bit_size=bit_size,
                     bit_offset=bit_offset,
+                    alignment=alignment,
                 )
             )
 
