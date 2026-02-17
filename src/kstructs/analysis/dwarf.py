@@ -59,6 +59,7 @@ def emit_c_types(
     correction_disable: set[str] | None = None,
     correction_verbose: set[str] | None = None,
     dwarf_verbose: set[str] | None = None,
+    type_prefix: str | None = None,
 ) -> str:
     dwarfinfo = dwarfinfo_from_path(filename, arch=arch)
     return generate_c_for_type(
@@ -68,4 +69,5 @@ def emit_c_types(
         correction_disable=correction_disable,
         correction_verbose=correction_verbose,
         dwarf_verbose=dwarf_verbose,
+        type_prefix=type_prefix,
     )

@@ -39,6 +39,11 @@ def main() -> None:
         help="Comma-separated list of DWARF debug logs to enable (null-members, or 'all').",
     )
     parser.add_argument(
+        "--type-prefix",
+        default=None,
+        help="Prefix all generated struct/union/enum tags and typedefs to avoid name collisions (e.g. ks_).",
+    )
+    parser.add_argument(
         "--output",
         default=None,
         help="Write generated C to this path instead of stdout.",
@@ -70,6 +75,7 @@ def main() -> None:
             for item in args.dwarf_verbose.split(",")
             if item.strip()
         },
+        type_prefix=args.type_prefix,
     )
     if args.output:
         Path(args.output).write_text(output, encoding="utf-8")
