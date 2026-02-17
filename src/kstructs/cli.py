@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 
-from .analysis.dwarf import emit_c_types, print_types
+from .analysis.dwarf import emit_c_types
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Parse DWARF data from ELF or Mach-O files.")
@@ -10,17 +10,6 @@ def main() -> None:
         "--arch",
         help="Select a specific Mach-O slice (e.g. x86_64, arm64, arm64e).",
         default=None,
-    )
-    parser.add_argument(
-        "--filter",
-        help="Only show types whose name contains this substring (case-insensitive).",
-        default=None,
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=100,
-        help="Limit number of type names printed (default: 100, use 0 to suppress).",
     )
     parser.add_argument(
         "--type",
@@ -56,34 +45,33 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.type_name:
-        if args.max_depth < 0:
-            raise ValueError("--max-depth must be >= 0")
-        output = emit_c_types(
-            args.path,
-            type_name=args.type_name,
-            arch=args.arch,
-            max_depth=args.max_depth,
-            correction_disable={
-                item.strip()
-                for item in args.correction_disable.split(",")
-                if item.strip()
-            },
-            correction_verbose={
-                item.strip()
-                for item in args.correction_verbose.split(",")
-                if item.strip()
-            },
-            dwarf_verbose={
-                item.strip()
-                for item in args.dwarf_verbose.split(",")
-                if item.strip()
-            },
-        )
-        if args.output:
-            Path(args.output).write_text(output, encoding="utf-8")
-        else:
-            print(output, end="")
-        return
+    if not args.type_name:
+        raise ValueError("--type is required")
 
-    print_types(args.path, arch=args.arch, name_filter=args.filter, limit=args.limit)
+    if args.max_depth < 0:
+        raise ValueError("--max-depth must be >= 0")
+    output = emit_c_types(
+        args.path,
+        type_name=args.type_name,
+        arch=args.arch,
+        max_depth=args.max_depth,
+        correction_disable={
+            item.strip()
+            for item in args.correction_disable.split(",")
+            if item.strip()
+        },
+        correction_verbose={
+            item.strip()
+            for item in args.correction_verbose.split(",")
+            if item.strip()
+        },
+        dwarf_verbose={
+            item.strip()
+            for item in args.dwarf_verbose.split(",")
+            if item.strip()
+        },
+    )
+    if args.output:
+        Path(args.output).write_text(output, encoding="utf-8")
+    else:
+        print(output, end="")
