@@ -1,5 +1,4 @@
 import hashlib
-import json
 from pathlib import Path
 import struct
 
@@ -20,7 +19,6 @@ DW_FORM = {name: value for name, value in ENUM_DW_FORM.items() if isinstance(val
 DW_TAG = {name: value for name, value in ENUM_DW_TAG.items() if isinstance(value, int)}
 
 TYPE_TAG_VALUES = {DW_TAG[name] for name in TYPE_TAG_NAMES}
-TYPE_TAG_NAME_BY_VALUE = {DW_TAG[name]: name for name in TYPE_TAG_NAMES}
 
 DW_AT_name = DW_AT["DW_AT_name"]
 DW_AT_str_offsets_base = DW_AT.get("DW_AT_str_offsets_base")
@@ -43,6 +41,10 @@ SKIP_CHILDREN_TAG_VALUES = {
     ]
     if value is not None
 }
+
+CACHE_MAGIC = b"KSTY"
+CACHE_VERSION = 1
+CACHE_FLAG_LITTLE_ENDIAN = 1
 
 
 def read_section_bytes(section) -> bytes | None:
@@ -347,7 +349,174 @@ def read_sibling_abs_from_form(
     return None, skip_form(form, info_data, offset, little_endian, addr_size, offset_size, dwarf_version)
 
 
-def scan_named_types(dwarfinfo, name_filter: str | None, sample_limit: int) -> tuple[int, dict[str, int], list[tuple[str, str]]]:
+def types_cache_key(filename: str, arch: str | None) -> str:
+    st = Path(filename).stat()
+    raw = f"{filename}\n{st.st_size}\n{st.st_mtime_ns}\n{arch or ''}\n".encode("utf-8", "replace")
+    return hashlib.sha256(raw).hexdigest()[:32]
+
+
+def types_cache_path(filename: str, arch: str | None) -> Path:
+    key = types_cache_key(filename, arch)
+    cache_dir = Path.home() / ".cache" / "kstructs"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"types-{key}.ksty"
+
+
+def write_uleb128(value: int) -> bytes:
+    if value < 0:
+        raise ValueError("uleb128 value must be >= 0")
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def parse_types_cache(data: bytes):
+    # Binary format (little-endian):
+    # - 4  magic "KSTY"
+    # - 2  version (u16)
+    # - 2  flags (u16) bit0 = little-endian
+    # - 8  source file size (u64)
+    # - 8  source mtime ns (u64)
+    # - 2  arch length (u16)
+    # - N  arch bytes (utf-8)
+    # - 8  entry count (u64) (named types)
+    # - 8*len(TYPE_TAG_NAMES) counts per tag (u64)
+    # - records:
+    #   - 1 tag index (u8)
+    #   - uleb128 name byte length
+    #   - name bytes (utf-8)
+    if len(data) < 4 + 2 + 2 + 8 + 8 + 2:
+        return None
+    magic = data[0:4]
+    if magic != CACHE_MAGIC:
+        return None
+    version = int.from_bytes(data[4:6], "little")
+    if version != CACHE_VERSION:
+        return None
+    flags = int.from_bytes(data[6:8], "little")
+    little_endian = bool(flags & CACHE_FLAG_LITTLE_ENDIAN)
+    if not little_endian:
+        return None
+    source_size = int.from_bytes(data[8:16], "little")
+    source_mtime_ns = int.from_bytes(data[16:24], "little")
+    arch_len = int.from_bytes(data[24:26], "little")
+    arch_start = 26
+    arch_end = arch_start + arch_len
+    if arch_end > len(data):
+        return None
+    arch = data[arch_start:arch_end].decode("utf-8", "replace")
+
+    fixed_header = arch_end
+    needed = fixed_header + 8 + (len(TYPE_TAG_NAMES) * 8)
+    if needed > len(data):
+        return None
+
+    entry_count = int.from_bytes(data[fixed_header:fixed_header + 8], "little")
+    counts_start = fixed_header + 8
+    counts = []
+    off = counts_start
+    for _ in range(len(TYPE_TAG_NAMES)):
+        counts.append(int.from_bytes(data[off:off + 8], "little"))
+        off += 8
+
+    records_offset = off
+    return {
+        "source_size": source_size,
+        "source_mtime_ns": source_mtime_ns,
+        "arch": arch,
+        "entry_count": entry_count,
+        "counts": counts,
+        "records_offset": records_offset,
+    }
+
+
+def load_types_cache_bytes(filename: str, arch: str | None) -> bytes | None:
+    path = types_cache_path(filename, arch)
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def load_types_cache_header(filename: str, arch: str | None):
+    cache_bytes = load_types_cache_bytes(filename, arch)
+    if cache_bytes is None:
+        return None
+    header = parse_types_cache(cache_bytes)
+    if header is None:
+        return None
+    st = Path(filename).stat()
+    if header["source_size"] != st.st_size or header["source_mtime_ns"] != st.st_mtime_ns:
+        return None
+    if header["arch"] != (arch or ""):
+        return None
+    header["cache_bytes"] = cache_bytes
+    return header
+
+
+def iter_cache_records(cache_bytes: bytes, offset: int):
+    end = len(cache_bytes)
+    while offset < end:
+        tag_index = cache_bytes[offset]
+        offset += 1
+        name_len, offset = read_uleb128(cache_bytes, offset)
+        name_end = offset + name_len
+        if name_end > end:
+            return
+        name = cache_bytes[offset:name_end].decode("utf-8", "replace")
+        offset = name_end
+        yield tag_index, name
+
+
+def sample_from_cache(cache_bytes: bytes, records_offset: int, limit: int) -> list[tuple[str, str]]:
+    if limit <= 0:
+        return []
+    sample: list[tuple[str, str]] = []
+    seen: set[tuple[int, str]] = set()
+    for tag_index, name in iter_cache_records(cache_bytes, records_offset):
+        if tag_index >= len(TYPE_TAG_NAMES):
+            continue
+        key = (tag_index, name)
+        if key in seen:
+            continue
+        seen.add(key)
+        sample.append((TYPE_TAG_NAMES[tag_index], name))
+        if len(sample) >= limit:
+            return sample
+    return sample
+
+
+def filter_from_cache(cache_bytes: bytes, records_offset: int, name_filter: str, limit: int) -> tuple[int, dict[str, int], list[tuple[str, str]]]:
+    filter_lower = name_filter.lower()
+    counts = [0] * len(TYPE_TAG_NAMES)
+    sample: list[tuple[str, str]] = []
+    seen: set[tuple[int, str]] = set()
+    total = 0
+    for tag_index, name in iter_cache_records(cache_bytes, records_offset):
+        if tag_index >= len(TYPE_TAG_NAMES):
+            continue
+        if filter_lower not in name.lower():
+            continue
+        total += 1
+        counts[tag_index] += 1
+        if limit > 0 and len(sample) < limit:
+            key = (tag_index, name)
+            if key not in seen:
+                seen.add(key)
+                sample.append((TYPE_TAG_NAMES[tag_index], name))
+    counts_dict = {TYPE_TAG_NAMES[i]: counts[i] for i in range(len(TYPE_TAG_NAMES)) if counts[i]}
+    return total, counts_dict, sample
+
+
+def iter_named_types(dwarfinfo):
     debug_info = read_section_bytes(dwarfinfo.debug_info_sec)
     debug_abbrev = read_section_bytes(dwarfinfo.debug_abbrev_sec)
     debug_str = read_section_bytes(dwarfinfo.debug_str_sec)
@@ -356,12 +525,7 @@ def scan_named_types(dwarfinfo, name_filter: str | None, sample_limit: int) -> t
         raise ValueError("Missing required DWARF sections: .debug_info/.debug_abbrev")
 
     little_endian = dwarfinfo.config.little_endian
-    filter_lower = name_filter.lower() if name_filter else None
-
     abbrev_cache: dict[int, dict[int, tuple[int, bool, list[tuple[int, int, int | None]]]]] = {}
-    counts_by_tag_value: dict[int, int] = {tag_value: 0 for tag_value in TYPE_TAG_VALUES}
-    sample: list[tuple[str, str]] = []
-    sample_seen: set[tuple[int, str]] = set()
 
     u16 = struct.Struct("<H" if little_endian else ">H")
     u32 = struct.Struct("<I" if little_endian else ">I")
@@ -443,7 +607,6 @@ def scan_named_types(dwarfinfo, name_filter: str | None, sample_limit: int) -> t
             tag_value, has_children, specs = abbrev
 
             is_type_tag = tag_value in TYPE_TAG_VALUES
-            has_name_attr = False
             found_name = None
             sibling_abs = None
 
@@ -455,43 +618,24 @@ def scan_named_types(dwarfinfo, name_filter: str | None, sample_limit: int) -> t
                         form, debug_info, cursor, little_endian, addr_size, offset_size, dwarf_version, unit_start
                     )
                     continue
-
                 if is_type_tag and attr == DW_AT_name:
-                    has_name_attr = True
-                    should_decode = filter_lower is not None or (sample_limit > 0 and len(sample) < sample_limit)
-                    if should_decode:
-                        found_name, cursor = read_name_from_form(
-                            form,
-                            debug_info,
-                            cursor,
-                            little_endian,
-                            addr_size,
-                            offset_size,
-                            dwarf_version,
-                            debug_str,
-                            debug_str_offsets,
-                            str_offsets_base,
-                        )
-                    else:
-                        cursor = skip_form(form, debug_info, cursor, little_endian, addr_size, offset_size, dwarf_version)
+                    found_name, cursor = read_name_from_form(
+                        form,
+                        debug_info,
+                        cursor,
+                        little_endian,
+                        addr_size,
+                        offset_size,
+                        dwarf_version,
+                        debug_str,
+                        debug_str_offsets,
+                        str_offsets_base,
+                    )
                 else:
                     cursor = skip_form(form, debug_info, cursor, little_endian, addr_size, offset_size, dwarf_version)
 
-            if is_type_tag and has_name_attr:
-                if filter_lower is None:
-                    counts_by_tag_value[tag_value] += 1
-                    if found_name and sample_limit > 0 and len(sample) < sample_limit:
-                        key = (tag_value, found_name)
-                        if key not in sample_seen:
-                            sample_seen.add(key)
-                            sample.append((TYPE_TAG_NAME_BY_VALUE.get(tag_value, f"DW_TAG_{tag_value}"), found_name))
-                elif found_name and filter_lower in found_name.lower():
-                    counts_by_tag_value[tag_value] += 1
-                    if sample_limit > 0 and len(sample) < sample_limit:
-                        key = (tag_value, found_name)
-                        if key not in sample_seen:
-                            sample_seen.add(key)
-                            sample.append((TYPE_TAG_NAME_BY_VALUE.get(tag_value, f"DW_TAG_{tag_value}"), found_name))
+            if is_type_tag and found_name:
+                yield tag_value, found_name
 
             if has_children:
                 if sibling_abs is not None and sibling_abs >= cursor and sibling_abs <= unit_end and (
@@ -501,75 +645,55 @@ def scan_named_types(dwarfinfo, name_filter: str | None, sample_limit: int) -> t
                 else:
                     depth += 1
 
-    total = sum(counts_by_tag_value.values())
-    counts = {
-        TYPE_TAG_NAME_BY_VALUE[tag_value]: counts_by_tag_value[tag_value]
-        for tag_value in TYPE_TAG_VALUES
-        if counts_by_tag_value[tag_value]
-    }
-    return total, counts, sample
 
-
-def types_cache_key(filename: str, arch: str | None) -> str:
-    st = Path(filename).stat()
-    raw = f"{filename}\n{st.st_size}\n{st.st_mtime_ns}\n{arch or ''}\n".encode("utf-8", "replace")
-    return hashlib.sha256(raw).hexdigest()[:32]
-
-
-def types_cache_path(filename: str, arch: str | None) -> Path:
-    key = types_cache_key(filename, arch)
-    cache_dir = Path.home() / ".cache" / "kstructs"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / f"types-{key}.json"
-
-
-def load_types_cache(filename: str, arch: str | None) -> dict | None:
+def build_types_cache(filename: str, arch: str | None, dwarfinfo) -> None:
     path = types_cache_path(filename, arch)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return None
-
-    if not isinstance(payload, dict) or payload.get("version") != 1:
-        return None
-    if payload.get("filename") != filename or payload.get("arch") != (arch or ""):
-        return None
-
-    st = Path(filename).stat()
-    if payload.get("size") != st.st_size or payload.get("mtime_ns") != st.st_mtime_ns:
-        return None
-
-    return payload
-
-
-def save_types_cache(filename: str, arch: str | None, total: int, counts: dict[str, int], sample: list[tuple[str, str]]) -> None:
-    path = types_cache_path(filename, arch)
-    st = Path(filename).stat()
-    payload = {
-        "version": 1,
-        "filename": filename,
-        "arch": arch or "",
-        "size": st.st_size,
-        "mtime_ns": st.st_mtime_ns,
-        "total": total,
-        "counts": counts,
-        "sample": sample,
-    }
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+
+    st = Path(filename).stat()
+    arch_bytes = (arch or "").encode("utf-8", "replace")
+    header_prefix = struct.pack(
+        "<4sHHQQH",
+        CACHE_MAGIC,
+        CACHE_VERSION,
+        CACHE_FLAG_LITTLE_ENDIAN,
+        st.st_size,
+        st.st_mtime_ns,
+        len(arch_bytes),
+    )
+
+    counts = [0] * len(TYPE_TAG_NAMES)
+    entry_count = 0
+    tag_index_by_value = {DW_TAG[name]: i for i, name in enumerate(TYPE_TAG_NAMES)}
+
+    with tmp.open("wb") as f:
+        f.write(header_prefix)
+        f.write(arch_bytes)
+
+        entry_count_offset = f.tell()
+        f.write(struct.pack("<Q", 0))
+        counts_offset = f.tell()
+        for _ in range(len(TYPE_TAG_NAMES)):
+            f.write(struct.pack("<Q", 0))
+
+        for tag_value, name in iter_named_types(dwarfinfo):
+            tag_index = tag_index_by_value.get(tag_value)
+            if tag_index is None:
+                continue
+            name_bytes = name.encode("utf-8", "replace")
+            f.write(bytes([tag_index]))
+            f.write(write_uleb128(len(name_bytes)))
+            f.write(name_bytes)
+            counts[tag_index] += 1
+            entry_count += 1
+
+        f.seek(entry_count_offset)
+        f.write(struct.pack("<Q", entry_count))
+        f.seek(counts_offset)
+        for count in counts:
+            f.write(struct.pack("<Q", count))
+
     tmp.replace(path)
-
-
-def load_types_summary(filename: str, arch: str | None, limit: int) -> tuple[int, dict[str, int], list[tuple[str, str]]] | None:
-    cached = load_types_cache(filename, arch)
-    if cached is None or not isinstance(cached.get("sample"), list) or len(cached["sample"]) < limit:
-        return None
-    total = int(cached["total"])
-    counts = {str(k): int(v) for k, v in dict(cached["counts"]).items()}
-    sample = [(str(tag), str(name)) for tag, name in cached["sample"][:limit]]
-    return total, counts, sample
 
 
 def build_types_summary(
@@ -579,9 +703,31 @@ def build_types_summary(
     name_filter: str | None,
     limit: int,
 ) -> tuple[int, dict[str, int], list[tuple[str, str]]]:
+    build_types_cache(filename, arch, dwarfinfo)
+    header = load_types_cache_header(filename, arch)
+    if header is None:
+        raise ValueError("Failed to build types cache.")
+
+    cache_bytes = header["cache_bytes"]
     if name_filter is None:
-        cache_limit = max(limit, 500)
-        total, counts, sample = scan_named_types(dwarfinfo, name_filter=None, sample_limit=cache_limit)
-        save_types_cache(filename, arch, total, counts, sample)
-        return total, counts, sample[:limit]
-    return scan_named_types(dwarfinfo, name_filter=name_filter, sample_limit=limit)
+        total = int(header["entry_count"])
+        counts_list = header["counts"]
+        counts = {TYPE_TAG_NAMES[i]: counts_list[i] for i in range(len(TYPE_TAG_NAMES)) if counts_list[i]}
+        sample = sample_from_cache(cache_bytes, header["records_offset"], limit)
+        return total, counts, sample
+
+    return filter_from_cache(cache_bytes, header["records_offset"], name_filter, limit)
+
+
+def load_types_summary(filename: str, arch: str | None, name_filter: str | None, limit: int):
+    header = load_types_cache_header(filename, arch)
+    if header is None:
+        return None
+    cache_bytes = header["cache_bytes"]
+    if name_filter is None:
+        total = int(header["entry_count"])
+        counts_list = header["counts"]
+        counts = {TYPE_TAG_NAMES[i]: counts_list[i] for i in range(len(TYPE_TAG_NAMES)) if counts_list[i]}
+        sample = sample_from_cache(cache_bytes, header["records_offset"], limit)
+        return total, counts, sample
+    return filter_from_cache(cache_bytes, header["records_offset"], name_filter, limit)
