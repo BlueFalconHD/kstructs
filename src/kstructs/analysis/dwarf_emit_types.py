@@ -35,6 +35,7 @@ class StructDecl:
     members: list[MemberInfo]
     opaque: bool = False
     name_origin: str = "dwarf"
+    packed: bool = False
 
 
 @dataclass
@@ -60,3 +61,5 @@ class TypeRegistry:
     typedefs: dict[str, TypedefDecl] = field(default_factory=dict)
     inline_members: dict[tuple[str, str, str], StructDecl] = field(default_factory=dict)
     inline_unions: dict[tuple[str, str, str], StructDecl] = field(default_factory=dict)
+    base_sizes: dict[str, int] = field(default_factory=dict)
+    pointer_size: int = 8

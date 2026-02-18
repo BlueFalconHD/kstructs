@@ -45,6 +45,9 @@ class TypeBuilder:
         self.max_depth = max_depth
         self._verbose = verbose or set()
         self.registry = TypeRegistry()
+        addr_size = getattr(getattr(dwarfinfo, "config", None), "default_address_size", None)
+        if isinstance(addr_size, int) and addr_size > 0:
+            self.registry.pointer_size = addr_size
         self.expr_parser = DWARFExprParser(dwarfinfo.structs)
         self._best_by_name_tag, self._name_index = self._build_type_index()
         self._anon_type_counter = 0
@@ -248,6 +251,9 @@ class TypeBuilder:
 
         if tag == BASE_TAG:
             name = self._die_name(die) or "uint8_t"
+            size = _attr_int(die.attributes.get("DW_AT_byte_size"))
+            if name and size is not None:
+                self.registry.base_sizes.setdefault(name, size)
             return CType(kind="named", name=name, ref_kind="base")
 
         if tag in {POINTER_TAG, REFERENCE_TAG, RV_REFERENCE_TAG}:
