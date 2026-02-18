@@ -367,6 +367,9 @@ class TypeBuilder:
             return CType(kind="named", name=name, ref_kind=kind)
 
         size = _attr_int(die.attributes.get("DW_AT_byte_size"))
+        alignment = _attr_int(die.attributes.get("DW_AT_alignment"))
+        if alignment is not None and alignment <= 1:
+            alignment = None
         if depth > self.max_depth:
             self.registry.structs[key] = StructDecl(
                 kind=kind,
@@ -375,6 +378,7 @@ class TypeBuilder:
                 members=[],
                 opaque=True,
                 name_origin=name_origin,
+                alignment=alignment,
             )
             return CType(kind="named", name=name, ref_kind=kind)
 
@@ -386,6 +390,7 @@ class TypeBuilder:
             members=[],
             opaque=False,
             name_origin=name_origin,
+            alignment=alignment,
         )
         self.registry.structs[key] = decl
 

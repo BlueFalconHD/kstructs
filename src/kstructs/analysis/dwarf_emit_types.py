@@ -36,6 +36,7 @@ class StructDecl:
     opaque: bool = False
     name_origin: str = "dwarf"
     packed: bool = False
+    alignment: Optional[int] = None
 
 
 @dataclass

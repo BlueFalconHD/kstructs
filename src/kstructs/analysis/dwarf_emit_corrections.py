@@ -553,16 +553,51 @@ def _struct_layout_matches(registry: TypeRegistry, decl: StructDecl, *, packed: 
 
 
 def _apply_infer_packed_structs(registry: TypeRegistry, log=None) -> None:
-    changed = False
-    for decl in registry.structs.values():
+    changed_any = False
+    visited: set[tuple[str, str]] = set()
+    visiting: set[tuple[str, str]] = set()
+
+    def walk_type(type_ref: CType) -> None:
+        resolved = _resolve_typedef(registry, type_ref, set())
+        if resolved.kind == "named" and resolved.ref_kind in {"struct", "union"} and resolved.name:
+            key = (resolved.ref_kind, resolved.name)
+            decl = registry.structs.get(key)
+            if decl is None:
+                return
+            if resolved.ref_kind == "struct":
+                ensure_struct(decl)
+                return
+            # For unions, recurse into member types to pack nested structs first.
+            for member in decl.members:
+                walk_type(member.type_ref)
+            return
+        if resolved.kind in {"pointer"}:
+            return
+        if resolved.kind == "array" and resolved.target is not None:
+            walk_type(resolved.target)
+
+    def ensure_struct(decl: StructDecl) -> None:
+        nonlocal changed_any
+        key = (decl.kind, decl.name)
+        if key in visited:
+            return
+        if key in visiting:
+            return
+        visiting.add(key)
+        for member in decl.members:
+            walk_type(member.type_ref)
+        visiting.remove(key)
+        visited.add(key)
+
         if decl.opaque or decl.packed:
-            continue
+            return
         if decl.kind != "struct":
-            continue
+            return
         if decl.size is None:
-            continue
+            return
         if any(member.bit_size is not None for member in decl.members):
-            continue
+            return
+
         ok, size = _struct_layout_matches(registry, decl, packed=False)
         if log is not None:
             if ok and size is not None:
@@ -570,7 +605,8 @@ def _apply_infer_packed_structs(registry: TypeRegistry, log=None) -> None:
             else:
                 log(f"struct {decl.name}: natural layout unresolved (dwarf 0x{decl.size:x})")
         if ok and size == decl.size:
-            continue
+            return
+
         ok_packed, size_packed = _struct_layout_matches(registry, decl, packed=True)
         if log is not None:
             if ok_packed and size_packed is not None:
@@ -579,10 +615,11 @@ def _apply_infer_packed_structs(registry: TypeRegistry, log=None) -> None:
                 log(f"struct {decl.name}: packed layout unresolved (dwarf 0x{decl.size:x})")
         if ok_packed and size_packed == decl.size:
             decl.packed = True
-            changed = True
+            changed_any = True
             if log is not None:
                 log(f"pack struct {decl.name}")
-            continue
+            return
+
         max_align, unknown = _max_member_alignment(registry, decl)
         if log is not None:
             if max_align is not None:
@@ -591,10 +628,16 @@ def _apply_infer_packed_structs(registry: TypeRegistry, log=None) -> None:
                 log(f"struct {decl.name}: missing alignment for {', '.join(unknown)}")
         if max_align is not None and max_align > 1 and decl.size % max_align != 0:
             decl.packed = True
-            changed = True
+            changed_any = True
             if log is not None:
                 log(f"pack struct {decl.name}: size 0x{decl.size:x} not multiple of align {max_align}")
-    if log is not None and not changed:
+
+    for decl in registry.structs.values():
+        if decl.kind != "struct":
+            continue
+        ensure_struct(decl)
+
+    if log is not None and not changed_any:
         log("no packed structs inferred")
 
 

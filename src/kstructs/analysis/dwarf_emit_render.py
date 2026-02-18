@@ -4,6 +4,22 @@ from .dwarf_emit_types import CType, StructDecl, TypeRegistry
 from .dwarf_emit_utils import _is_synthetic_member_name, _resolve_typedef
 
 
+_SIGNED_INT_MAX = (1 << 31) - 1
+
+
+def _format_hex_const(value: int) -> str:
+    if value < 0:
+        return f"-0x{abs(value):x}"
+    suffix = "U" if value > _SIGNED_INT_MAX else ""
+    return f"0x{value:x}{suffix}"
+
+
+def _format_int_const(value: int) -> str:
+    if abs(value) < 16:
+        return str(value)
+    return _format_hex_const(value)
+
+
 def render_type(
     registry: TypeRegistry,
     type_ref: CType,
@@ -41,7 +57,7 @@ def render_type(
         return render_type(registry, type_ref.target or CType(kind="named", name="void", ref_kind="base"), inner, expand_typedefs)
 
     if type_ref.kind == "array":
-        count = "" if type_ref.count is None else str(type_ref.count)
+        count = "" if type_ref.count is None else _format_int_const(type_ref.count)
         inner = f"{name}[{count}]" if name else f"[{count}]"
         return render_type(registry, type_ref.target or CType(kind="named", name="void", ref_kind="base"), inner, expand_typedefs)
 
@@ -165,7 +181,7 @@ def render_c(registry: TypeRegistry) -> str:
             else:
                 lines.append(f"enum {enum_decl.name} {{")
             for enum_name, value in enum_decl.enumerators:
-                lines.append(f"    {enum_name} = {value},")
+                lines.append(f"    {enum_name} = {_format_int_const(value)},")
             lines.append("};")
             lines.append("")
             continue
@@ -180,8 +196,12 @@ def render_c(registry: TypeRegistry) -> str:
             inline_union = registry.inline_unions.get((decl.kind, decl.name, member.name))
             if inline_union is not None:
                 align_suffix = ""
-                if member.alignment is not None:
-                    align_suffix = f" __attribute__((aligned({member.alignment})))"
+                align_value = member.alignment
+                if inline_union.alignment is not None:
+                    if align_value is None or inline_union.alignment > align_value:
+                        align_value = inline_union.alignment
+                if align_value is not None:
+                    align_suffix = f" __attribute__((aligned({align_value})))"
                 packed_suffix = " __attribute__((packed))" if inline_union.packed else ""
                 skip_members.add(member.name)
                 lines.append("    union {")
@@ -242,8 +262,12 @@ def render_c(registry: TypeRegistry) -> str:
             inline_decl = registry.inline_members.get((decl.kind, decl.name, member.name))
             if inline_decl is not None:
                 align_suffix = ""
-                if member.alignment is not None:
-                    align_suffix = f" __attribute__((aligned({member.alignment})))"
+                align_value = member.alignment
+                if inline_decl.alignment is not None:
+                    if align_value is None or inline_decl.alignment > align_value:
+                        align_value = inline_decl.alignment
+                if align_value is not None:
+                    align_suffix = f" __attribute__((aligned({align_value})))"
                 packed_suffix = " __attribute__((packed))" if inline_decl.packed else ""
                 emit_anonymous = inline_decl.name_origin in {"anon", "member"} and _is_synthetic_member_name(member.name)
                 if emit_anonymous:
@@ -252,9 +276,113 @@ def render_c(registry: TypeRegistry) -> str:
                         for submember in inline_decl.members:
                             if submember.offset is None or submember.bit_size is not None:
                                 continue
+                            if _is_synthetic_member_name(submember.name):
+                                continue
                             extra_asserts.append((submember.name, member.offset + submember.offset))
                 lines.append("    struct {")
                 for submember in inline_decl.members:
+                    inline_union = registry.inline_unions.get((inline_decl.kind, inline_decl.name, submember.name))
+                    if inline_union is not None:
+                        nested_align_suffix = ""
+                        if submember.alignment is not None:
+                            nested_align_suffix = f" __attribute__((aligned({submember.alignment})))"
+                        nested_packed_suffix = " __attribute__((packed))" if inline_union.packed else ""
+                        base_offset = None
+                        if member.offset is not None and submember.offset is not None:
+                            base_offset = member.offset + submember.offset
+                        lines.append("        union {")
+                        for union_member in inline_union.members:
+                            inline_nested = registry.inline_members.get((inline_union.kind, inline_union.name, union_member.name))
+                            if inline_nested is not None:
+                                emit_nested = inline_nested.name_origin in {"anon", "member"} and _is_synthetic_member_name(union_member.name)
+                                if emit_anonymous and base_offset is not None and union_member.offset is not None:
+                                    if emit_nested:
+                                        for inline_member in inline_nested.members:
+                                            if inline_member.offset is None or inline_member.bit_size is not None:
+                                                continue
+                                            extra_asserts.append(
+                                                (inline_member.name, base_offset + union_member.offset + inline_member.offset)
+                                            )
+                                    else:
+                                        extra_asserts.append((union_member.name, base_offset + union_member.offset))
+                                lines.append("            struct {")
+                                for inline_member in inline_nested.members:
+                                    if inline_member.bit_size is not None:
+                                        decl_text = render_type(
+                                            registry, inline_member.type_ref, inline_member.name, expand_typedefs=True
+                                        )
+                                        if inline_member.bit_offset is not None:
+                                            lines.append(
+                                                f"                {decl_text} : {inline_member.bit_size}; /* bit offset {inline_member.bit_offset} */"
+                                            )
+                                        else:
+                                            lines.append(f"                {decl_text} : {inline_member.bit_size};")
+                                    else:
+                                        decl_text = render_type(
+                                            registry, inline_member.type_ref, inline_member.name, expand_typedefs=True
+                                        )
+                                        lines.append(f"                {decl_text};")
+                                if emit_nested:
+                                    lines.append("            };")
+                                else:
+                                    lines.append(f"            }} {union_member.name};")
+                                continue
+                            if (
+                                emit_anonymous
+                                and base_offset is not None
+                                and union_member.offset is not None
+                                and union_member.bit_size is None
+                            ):
+                                extra_asserts.append((union_member.name, base_offset + union_member.offset))
+                            if union_member.bit_size is not None:
+                                decl_text = render_type(registry, union_member.type_ref, union_member.name, expand_typedefs=True)
+                                if union_member.bit_offset is not None:
+                                    lines.append(
+                                        f"            {decl_text} : {union_member.bit_size}; /* bit offset {union_member.bit_offset} */"
+                                    )
+                                else:
+                                    lines.append(f"            {decl_text} : {union_member.bit_size};")
+                            else:
+                                decl_text = render_type(registry, union_member.type_ref, union_member.name, expand_typedefs=True)
+                                lines.append(f"            {decl_text};")
+                        lines.append(f"        }}{nested_packed_suffix}{nested_align_suffix};")
+                        continue
+                    inline_nested = registry.inline_members.get((inline_decl.kind, inline_decl.name, submember.name))
+                    if inline_nested is not None:
+                        emit_nested = inline_nested.name_origin in {"anon", "member"} and _is_synthetic_member_name(submember.name)
+                        base_offset = None
+                        if member.offset is not None and submember.offset is not None:
+                            base_offset = member.offset + submember.offset
+                        lines.append("        struct {")
+                        for inline_member in inline_nested.members:
+                            if (
+                                emit_anonymous
+                                and emit_nested
+                                and base_offset is not None
+                                and inline_member.offset is not None
+                                and inline_member.bit_size is None
+                            ):
+                                extra_asserts.append((inline_member.name, base_offset + inline_member.offset))
+                            if inline_member.bit_size is not None:
+                                decl_text = render_type(
+                                    registry, inline_member.type_ref, inline_member.name, expand_typedefs=True
+                                )
+                                if inline_member.bit_offset is not None:
+                                    lines.append(
+                                        f"            {decl_text} : {inline_member.bit_size}; /* bit offset {inline_member.bit_offset} */"
+                                    )
+                                else:
+                                    lines.append(f"            {decl_text} : {inline_member.bit_size};")
+                            else:
+                                decl_text = render_type(
+                                    registry, inline_member.type_ref, inline_member.name, expand_typedefs=True
+                                )
+                                lines.append(f"            {decl_text};")
+                        if emit_nested:
+                            lines.append("        };")
+                        else:
+                            lines.append(f"        }} {submember.name};")
+                        continue
                     if submember.bit_size is not None:
                         decl_text = render_type(registry, submember.type_ref, submember.name, expand_typedefs=True)
                         if submember.bit_offset is not None:
@@ -282,7 +410,10 @@ def render_c(registry: TypeRegistry) -> str:
                 else:
                     lines.append(f"    {decl_text};")
         packed_suffix = " __attribute__((packed))" if decl.packed else ""
-        lines.append(f"}}{packed_suffix};")
+        align_suffix = ""
+        if decl.alignment is not None:
+            align_suffix = f" __attribute__((aligned({decl.alignment})))"
+        lines.append(f"}}{packed_suffix}{align_suffix};")
 
         if not decl.opaque:
             type_name = f"{decl.kind} {decl.name}"
@@ -292,17 +423,17 @@ def render_c(registry: TypeRegistry) -> str:
                 if member.offset is None or member.bit_size is not None:
                     continue
                 lines.append(
-                    f"_Static_assert(offsetof({type_name}, {member.name}) == 0x{member.offset:x}, "
+                    f"_Static_assert(offsetof({type_name}, {member.name}) == {_format_hex_const(member.offset)}, "
                     f"\"{decl.name}.{member.name} offset\");"
                 )
             for member_name, offset in extra_asserts:
                 lines.append(
-                    f"_Static_assert(offsetof({type_name}, {member_name}) == 0x{offset:x}, "
+                    f"_Static_assert(offsetof({type_name}, {member_name}) == {_format_hex_const(offset)}, "
                     f"\"{decl.name}.{member_name} offset\");"
                 )
             if decl.kind == "struct" and decl.size is not None:
                 lines.append(
-                    f"_Static_assert(sizeof({type_name}) == 0x{decl.size:x}, \"{decl.name} size\");"
+                    f"_Static_assert(sizeof({type_name}) == {_format_hex_const(decl.size)}, \"{decl.name} size\");"
                 )
         lines.append("")
 
