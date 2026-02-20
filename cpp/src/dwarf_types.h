@@ -102,6 +102,7 @@ struct TypeRegistry {
   std::map<InlineKey, StructDecl> inline_members;
   std::map<InlineKey, StructDecl> inline_unions;
   std::unordered_map<std::string, int64_t> base_sizes;
+  int64_t source_type_count = 0;
   int64_t pointer_size = 8;
 };
 

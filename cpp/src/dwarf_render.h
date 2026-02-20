@@ -3,6 +3,7 @@
 
 #include "dwarf_types.h"
 
+#include <optional>
 #include <string>
 
 namespace kstructs {
@@ -12,7 +13,8 @@ std::string render_type(const TypeRegistry &registry,
                         const std::string &name,
                         bool expand_typedefs);
 
-std::string render_c(const TypeRegistry &registry);
+std::string render_c(const TypeRegistry &registry,
+                     const std::optional<std::string> &include_guard);
 
 } // namespace kstructs
 

@@ -160,6 +160,7 @@ void TypeBuilder::build_type_index() {
       if (INDEX_TAGS.count(tag) == 0) {
         continue;
       }
+      registry.source_type_count += 1;
       auto name = die.getName(llvm::DINameKind::ShortName);
       if (!name || std::string(name).empty()) {
         continue;

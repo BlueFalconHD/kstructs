@@ -315,74 +315,7 @@ static void apply_xnu_list_entry_inline(TypeRegistry &registry, const Correction
   }
 }
 
-static std::map<KindNameKey, int> count_named_union_refs(const TypeRegistry &registry) {
-  std::map<KindNameKey, int> counts;
-
-  std::function<void(const CTypePtr &)> visit = [&](const CTypePtr &type_ref) {
-    std::unordered_set<std::string> seen;
-    CTypePtr resolved = resolve_typedef(registry, type_ref, seen);
-    if (!resolved) {
-      return;
-    }
-    if (resolved->kind == TypeKind::Named && resolved->ref_kind == "union" && !resolved->name.empty()) {
-      KindNameKey key{"union", resolved->name};
-      counts[key] += 1;
-      return;
-    }
-    if ((resolved->kind == TypeKind::Pointer || resolved->kind == TypeKind::Array) && resolved->target) {
-      visit(resolved->target);
-    }
-  };
-
-  for (const auto &pair : registry.structs) {
-    const StructDecl &decl = pair.second;
-    for (const auto &member : decl.members) {
-      visit(member.type_ref);
-    }
-  }
-
-  for (const auto &pair : registry.typedefs) {
-    visit(pair.second.target);
-  }
-
-  return counts;
-}
-
-static std::map<KindNameKey, int> count_named_struct_refs(const TypeRegistry &registry) {
-  std::map<KindNameKey, int> counts;
-
-  std::function<void(const CTypePtr &)> visit = [&](const CTypePtr &type_ref) {
-    std::unordered_set<std::string> seen;
-    CTypePtr resolved = resolve_typedef(registry, type_ref, seen);
-    if (!resolved) {
-      return;
-    }
-    if (resolved->kind == TypeKind::Named && resolved->ref_kind == "struct" && !resolved->name.empty()) {
-      KindNameKey key{"struct", resolved->name};
-      counts[key] += 1;
-      return;
-    }
-    if ((resolved->kind == TypeKind::Pointer || resolved->kind == TypeKind::Array) && resolved->target) {
-      visit(resolved->target);
-    }
-  };
-
-  for (const auto &pair : registry.structs) {
-    const StructDecl &decl = pair.second;
-    for (const auto &member : decl.members) {
-      visit(member.type_ref);
-    }
-  }
-
-  for (const auto &pair : registry.typedefs) {
-    visit(pair.second.target);
-  }
-
-  return counts;
-}
-
 static void apply_xnu_anonymous_union_inline(TypeRegistry &registry, const CorrectionLog &log) {
-  auto usage = count_named_union_refs(registry);
   int inlined = 0;
 
   for (auto &pair : registry.structs) {
@@ -392,9 +325,6 @@ static void apply_xnu_anonymous_union_inline(TypeRegistry &registry, const Corre
       continue;
     }
     for (auto &member : decl.members) {
-      if (!is_synthetic_member_name(member.name)) {
-        continue;
-      }
       std::unordered_set<std::string> seen;
       CTypePtr resolved = resolve_typedef(registry, member.type_ref, seen);
       if (!resolved || resolved->kind != TypeKind::Named || resolved->ref_kind != "union" || resolved->name.empty()) {
@@ -415,13 +345,6 @@ static void apply_xnu_anonymous_union_inline(TypeRegistry &registry, const Corre
         }
         continue;
       }
-      if (usage[ukey] != 1) {
-        if (log) {
-          log("skip union " + resolved->name + " in " + key.name + "." + member.name + ": used " +
-              std::to_string(usage[ukey]) + "x");
-        }
-        continue;
-      }
 
       registry.inline_unions[{key.kind, key.name, member.name}] = union_decl;
       inlined += 1;
@@ -437,7 +360,6 @@ static void apply_xnu_anonymous_union_inline(TypeRegistry &registry, const Corre
 }
 
 static void apply_inline_anonymous_structs(TypeRegistry &registry, const CorrectionLog &log) {
-  auto usage = count_named_struct_refs(registry);
   int inlined = 0;
 
   for (auto &pair : registry.structs) {
@@ -468,13 +390,6 @@ static void apply_inline_anonymous_structs(TypeRegistry &registry, const Correct
       if (struct_decl.name_origin != "anon" && struct_decl.name_origin != "member") {
         if (log) {
           log("skip struct " + resolved->name + " in " + key.name + "." + member.name + ": named struct");
-        }
-        continue;
-      }
-      if (usage[skey] != 1) {
-        if (log) {
-          log("skip struct " + resolved->name + " in " + key.name + "." + member.name + ": used " +
-              std::to_string(usage[skey]) + "x");
         }
         continue;
       }

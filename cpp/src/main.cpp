@@ -18,7 +18,10 @@
 #include <llvm/Support/WithColor.h>
 
 #include <filesystem>
+#include <iomanip>
+#include <random>
 #include <set>
+#include <sstream>
 
 using namespace llvm;
 using namespace llvm::object;
@@ -29,12 +32,13 @@ struct Options {
   std::string path;
   std::string arch;
   bool has_arch = false;
-  std::string type_name;
+  std::vector<std::string> type_names;
   int max_depth = 1;
   std::set<std::string> correction_disable;
   std::set<std::string> correction_verbose;
   std::set<std::string> dwarf_verbose;
   std::optional<std::string> type_prefix;
+  bool include_guard = false;
   std::string output;
   bool has_output = false;
 };
@@ -58,6 +62,34 @@ static std::set<std::string> split_set(const std::string &value) {
     }
     if (right > left) {
       out.insert(token.substr(left, right - left));
+    }
+    if (end == value.size()) {
+      break;
+    }
+    start = end + 1;
+  }
+  return out;
+}
+
+static std::vector<std::string> split_list(const std::string &value) {
+  std::vector<std::string> out;
+  size_t start = 0;
+  while (start <= value.size()) {
+    size_t end = value.find(',', start);
+    if (end == std::string::npos) {
+      end = value.size();
+    }
+    std::string token = value.substr(start, end - start);
+    size_t left = 0;
+    while (left < token.size() && std::isspace(static_cast<unsigned char>(token[left]))) {
+      left++;
+    }
+    size_t right = token.size();
+    while (right > left && std::isspace(static_cast<unsigned char>(token[right - 1]))) {
+      right--;
+    }
+    if (right > left) {
+      out.push_back(token.substr(left, right - left));
     }
     if (end == value.size()) {
       break;
@@ -109,22 +141,41 @@ static void expand_dsym_objects(StringRef path, std::vector<std::string> &object
   error_or_exit(dsym.takeError(), path);
 }
 
-static void handle_object(ObjectFile &obj, DWARFContext &ctx, const Options &options, raw_ostream &os) {
+static void handle_object(ObjectFile &obj,
+                          DWARFContext &ctx,
+                          const Options &options,
+                          raw_ostream &os,
+                          std::optional<std::string> *include_guard) {
   TypeBuilder builder(ctx, options.max_depth, options.dwarf_verbose);
-  auto root = builder.find_root_die(options.type_name);
-  builder.build_from_root(root);
+  for (const auto &type_name : options.type_names) {
+    auto root = builder.find_root_die(type_name);
+    builder.build_from_root(root);
+  }
 
   apply_corrections(builder.registry, options.correction_disable, &options.correction_verbose);
   if (options.type_prefix) {
     apply_type_prefix(builder.registry, options.type_prefix.value());
   }
 
-  os << render_c(builder.registry);
+  std::optional<std::string> guard_value;
+  if (include_guard && include_guard->has_value()) {
+    guard_value = *include_guard;
+    include_guard->reset();
+  }
+  os << render_c(builder.registry, guard_value);
 }
 
-static bool handle_buffer(StringRef filename, MemoryBufferRef buffer, const Options &options, raw_ostream &os);
+static bool handle_buffer(StringRef filename,
+                          MemoryBufferRef buffer,
+                          const Options &options,
+                          raw_ostream &os,
+                          std::optional<std::string> *include_guard);
 
-static bool handle_archive(StringRef filename, Archive &archive, const Options &options, raw_ostream &os) {
+static bool handle_archive(StringRef filename,
+                           Archive &archive,
+                           const Options &options,
+                           raw_ostream &os,
+                           std::optional<std::string> *include_guard) {
   bool result = true;
   Error err = Error::success();
   for (const auto &child : archive.children(err)) {
@@ -133,13 +184,17 @@ static bool handle_archive(StringRef filename, Archive &archive, const Options &
     auto name_or = child.getName();
     error_or_exit(name_or.takeError(), filename);
     std::string name = (filename + "(" + name_or.get() + ")").str();
-    result &= handle_buffer(name, buffer_or.get(), options, os);
+    result &= handle_buffer(name, buffer_or.get(), options, os, include_guard);
   }
   error_or_exit(std::move(err), filename);
   return result;
 }
 
-static bool handle_buffer(StringRef filename, MemoryBufferRef buffer, const Options &options, raw_ostream &os) {
+static bool handle_buffer(StringRef filename,
+                          MemoryBufferRef buffer,
+                          const Options &options,
+                          raw_ostream &os,
+                          std::optional<std::string> *include_guard) {
   Expected<std::unique_ptr<Binary>> bin_or_err = object::createBinary(buffer);
   if (!bin_or_err) {
     error_or_exit(bin_or_err.takeError(), filename);
@@ -152,7 +207,7 @@ static bool handle_buffer(StringRef filename, MemoryBufferRef buffer, const Opti
     }
     auto ctx = DWARFContext::create(*obj, DWARFContext::ProcessDebugRelocations::Process, nullptr, "",
                                     WithColor::defaultErrorHandler, WithColor::defaultWarningHandler, true);
-    handle_object(*obj, *ctx, options, os);
+    handle_object(*obj, *ctx, options, os, include_guard);
     return true;
   }
 
@@ -166,14 +221,14 @@ static bool handle_buffer(StringRef filename, MemoryBufferRef buffer, const Opti
         }
         auto ctx = DWARFContext::create(obj, DWARFContext::ProcessDebugRelocations::Process, nullptr, "",
                                         WithColor::defaultErrorHandler, WithColor::defaultWarningHandler, true);
-        handle_object(obj, *ctx, options, os);
+        handle_object(obj, *ctx, options, os, include_guard);
         continue;
       } else {
         consumeError(mach_or_err.takeError());
       }
       if (auto archive_or_err = obj_for_arch.getAsArchive()) {
         error_or_exit(archive_or_err.takeError(), filename);
-        result &= handle_archive(filename, *archive_or_err.get(), options, os);
+        result &= handle_archive(filename, *archive_or_err.get(), options, os, include_guard);
       } else {
         consumeError(archive_or_err.takeError());
       }
@@ -182,19 +237,36 @@ static bool handle_buffer(StringRef filename, MemoryBufferRef buffer, const Opti
   }
 
   if (auto *archive = dyn_cast<Archive>(bin_or_err->get())) {
-    return handle_archive(filename, *archive, options, os);
+    return handle_archive(filename, *archive, options, os, include_guard);
   }
 
   return false;
 }
 
-static bool handle_file(StringRef filename, const Options &options, raw_ostream &os) {
+static bool handle_file(StringRef filename,
+                        const Options &options,
+                        raw_ostream &os,
+                        std::optional<std::string> *include_guard) {
   auto buffer_or = MemoryBuffer::getFileOrSTDIN(filename);
   if (!buffer_or) {
     error_or_exit(errorCodeToError(buffer_or.getError()), filename);
     return false;
   }
-  return handle_buffer(filename, *buffer_or.get(), options, os);
+  return handle_buffer(filename, *buffer_or.get(), options, os, include_guard);
+}
+
+static std::string make_guard() {
+  std::random_device rd;
+  std::mt19937_64 gen(rd());
+  std::uniform_int_distribution<uint64_t> dist;
+  uint64_t a = dist(gen);
+  uint64_t b = dist(gen);
+  std::ostringstream oss;
+  oss << "KSTRUCTS_GUARD_" << std::hex << std::uppercase
+      << std::setw(16) << std::setfill('0') << a
+      << std::setw(16) << std::setfill('0') << b
+      << "_H";
+  return oss.str();
 }
 
 static Options parse_options(int argc, char **argv) {
@@ -203,7 +275,7 @@ static Options parse_options(int argc, char **argv) {
                                   cl::Required, cl::cat(category));
   cl::opt<std::string> arch("arch", cl::desc("Select a specific Mach-O slice (e.g. x86_64, arm64, arm64e)"),
                             cl::init(""), cl::cat(category));
-  cl::opt<std::string> type_name("type", cl::desc("Generate C definitions for the given DWARF type name"),
+  cl::opt<std::string> type_name("type", cl::desc("Generate C definitions for the given DWARF type name(s)"),
                                  cl::Required, cl::cat(category));
   cl::opt<int> max_depth("max-depth", cl::desc("Maximum pointer recursion depth"), cl::init(1),
                          cl::cat(category));
@@ -219,6 +291,9 @@ static Options parse_options(int argc, char **argv) {
   cl::opt<std::string> type_prefix("type-prefix",
                                    cl::desc("Prefix all generated struct/union/enum tags and typedefs"),
                                    cl::init(""), cl::cat(category));
+  cl::opt<bool> include_guard("include-guard",
+                              cl::desc("Emit an include guard in the generated output"),
+                              cl::init(false), cl::cat(category));
   cl::opt<std::string> output("output", cl::desc("Write generated C to this path instead of stdout"),
                               cl::init(""), cl::cat(category));
 
@@ -231,7 +306,11 @@ static Options parse_options(int argc, char **argv) {
     options.arch = arch;
     options.has_arch = true;
   }
-  options.type_name = type_name;
+  options.type_names = split_list(type_name);
+  if (options.type_names.empty()) {
+    WithColor::error() << "--type must include at least one type name\n";
+    exit(1);
+  }
   options.max_depth = max_depth;
   options.correction_disable = split_set(correction_disable);
   options.correction_verbose = split_set(correction_verbose);
@@ -239,6 +318,7 @@ static Options parse_options(int argc, char **argv) {
   if (!type_prefix.empty()) {
     options.type_prefix = type_prefix;
   }
+  options.include_guard = include_guard;
   if (!output.empty()) {
     options.output = output;
     options.has_output = true;
@@ -277,8 +357,12 @@ int main(int argc, char **argv) {
   }
 
   bool success = true;
+  std::optional<std::string> include_guard;
+  if (options.include_guard) {
+    include_guard = kstructs::make_guard();
+  }
   for (const auto &obj : objects) {
-    success &= kstructs::handle_file(obj, options, *os);
+    success &= kstructs::handle_file(obj, options, *os, &include_guard);
   }
 
   return success ? 0 : 1;
