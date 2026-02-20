@@ -1,6 +1,7 @@
 #ifndef KSTRUCTS_DWARF_TYPES_H
 #define KSTRUCTS_DWARF_TYPES_H
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -49,6 +50,7 @@ struct StructDecl {
   bool opaque = false;
   std::string name_origin = "dwarf";
   bool packed = false;
+  std::optional<int64_t> pack;
   std::optional<int64_t> alignment;
 };
 
@@ -101,6 +103,150 @@ struct TypeRegistry {
   std::map<InlineKey, StructDecl> inline_unions;
   std::unordered_map<std::string, int64_t> base_sizes;
   int64_t pointer_size = 8;
+};
+
+class TypeFactory {
+public:
+  CTypePtr named(const std::string &name, const std::string &ref_kind) {
+    return named(name, ref_kind, {});
+  }
+
+  CTypePtr named(const std::string &name, const std::string &ref_kind,
+                 const std::vector<std::string> &qualifiers) {
+    std::string key = key_named(name, ref_kind, qualifiers);
+    auto it = named_cache_.find(key);
+    if (it != named_cache_.end()) {
+      return it->second;
+    }
+    auto ref = std::make_shared<CType>();
+    ref->kind = TypeKind::Named;
+    ref->name = name;
+    ref->ref_kind = ref_kind;
+    ref->qualifiers = qualifiers;
+    named_cache_[key] = ref;
+    return ref;
+  }
+
+  CTypePtr pointer(const CTypePtr &target) { return pointer(target, {}); }
+
+  CTypePtr pointer(const CTypePtr &target, const std::vector<std::string> &qualifiers) {
+    std::string key = key_pointer(target, qualifiers);
+    auto it = pointer_cache_.find(key);
+    if (it != pointer_cache_.end()) {
+      return it->second;
+    }
+    auto ref = std::make_shared<CType>();
+    ref->kind = TypeKind::Pointer;
+    ref->target = target;
+    ref->qualifiers = qualifiers;
+    pointer_cache_[key] = ref;
+    return ref;
+  }
+
+  CTypePtr array(const CTypePtr &target, std::optional<int64_t> count) {
+    std::string key = key_array(target, count);
+    auto it = array_cache_.find(key);
+    if (it != array_cache_.end()) {
+      return it->second;
+    }
+    auto ref = std::make_shared<CType>();
+    ref->kind = TypeKind::Array;
+    ref->target = target;
+    ref->count = count;
+    array_cache_[key] = ref;
+    return ref;
+  }
+
+  CTypePtr qualify(const CTypePtr &type_ref, const std::string &qualifier) {
+    if (!type_ref) {
+      return type_ref;
+    }
+    if (type_ref->kind == TypeKind::Named) {
+      if (has_qualifier(type_ref->qualifiers, qualifier)) {
+        return type_ref;
+      }
+      return named(type_ref->name, type_ref->ref_kind, add_qualifier(type_ref->qualifiers, qualifier));
+    }
+    if (type_ref->kind == TypeKind::Pointer) {
+      if (qualifier == "_Atomic") {
+        if (has_qualifier(type_ref->qualifiers, qualifier)) {
+          return type_ref;
+        }
+        return pointer(type_ref->target, add_qualifier(type_ref->qualifiers, qualifier));
+      }
+      if (!type_ref->target) {
+        return type_ref;
+      }
+      CTypePtr qualified_target = qualify(type_ref->target, qualifier);
+      if (qualified_target == type_ref->target) {
+        return type_ref;
+      }
+      return pointer(qualified_target, type_ref->qualifiers);
+    }
+    if (type_ref->kind == TypeKind::Array) {
+      if (!type_ref->target) {
+        return type_ref;
+      }
+      CTypePtr qualified_target = qualify(type_ref->target, qualifier);
+      if (qualified_target == type_ref->target) {
+        return type_ref;
+      }
+      return array(qualified_target, type_ref->count);
+    }
+    return type_ref;
+  }
+
+private:
+  static bool has_qualifier(const std::vector<std::string> &qualifiers, const std::string &qualifier) {
+    return std::find(qualifiers.begin(), qualifiers.end(), qualifier) != qualifiers.end();
+  }
+
+  static std::vector<std::string> add_qualifier(const std::vector<std::string> &qualifiers,
+                                                const std::string &qualifier) {
+    if (has_qualifier(qualifiers, qualifier)) {
+      return qualifiers;
+    }
+    std::vector<std::string> out;
+    out.reserve(qualifiers.size() + 1);
+    out.push_back(qualifier);
+    out.insert(out.end(), qualifiers.begin(), qualifiers.end());
+    return out;
+  }
+
+  static std::string join_qualifiers(const std::vector<std::string> &qualifiers) {
+    if (qualifiers.empty()) {
+      return std::string();
+    }
+    std::string out;
+    for (size_t i = 0; i < qualifiers.size(); ++i) {
+      if (i) {
+        out += ",";
+      }
+      out += qualifiers[i];
+    }
+    return out;
+  }
+
+  static std::string ptr_id(const CTypePtr &ptr) {
+    return std::to_string(reinterpret_cast<uintptr_t>(ptr.get()));
+  }
+
+  static std::string key_named(const std::string &name, const std::string &ref_kind,
+                               const std::vector<std::string> &qualifiers) {
+    return "N|" + ref_kind + "|" + name + "|" + join_qualifiers(qualifiers);
+  }
+
+  static std::string key_pointer(const CTypePtr &target, const std::vector<std::string> &qualifiers) {
+    return "P|" + ptr_id(target) + "|" + join_qualifiers(qualifiers);
+  }
+
+  static std::string key_array(const CTypePtr &target, std::optional<int64_t> count) {
+    return "A|" + ptr_id(target) + "|" + (count ? std::to_string(*count) : "?");
+  }
+
+  std::unordered_map<std::string, CTypePtr> named_cache_;
+  std::unordered_map<std::string, CTypePtr> pointer_cache_;
+  std::unordered_map<std::string, CTypePtr> array_cache_;
 };
 
 inline CTypePtr make_named(const std::string &name, const std::string &ref_kind) {

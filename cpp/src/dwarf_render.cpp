@@ -32,6 +32,48 @@ static std::string format_int_const(int64_t value) {
   return format_hex_const(value);
 }
 
+static std::set<KindNameKey> collect_named_refs(const TypeRegistry &registry) {
+  std::set<KindNameKey> refs;
+
+  std::function<void(const CTypePtr &)> visit = [&](const CTypePtr &type_ref) {
+    if (!type_ref) {
+      return;
+    }
+    std::unordered_set<std::string> seen;
+    CTypePtr resolved = resolve_typedef(registry, type_ref, seen);
+    if (!resolved) {
+      return;
+    }
+    if (resolved->kind == TypeKind::Named) {
+      if ((resolved->ref_kind == "struct" || resolved->ref_kind == "union" || resolved->ref_kind == "enum") &&
+          !resolved->name.empty()) {
+        refs.insert({resolved->ref_kind, resolved->name});
+      }
+      return;
+    }
+    if ((resolved->kind == TypeKind::Pointer || resolved->kind == TypeKind::Array) && resolved->target) {
+      visit(resolved->target);
+    }
+  };
+
+  for (const auto &pair : registry.structs) {
+    const StructDecl &decl = pair.second;
+    for (const auto &member : decl.members) {
+      visit(member.type_ref);
+    }
+  }
+
+  for (const auto &pair : registry.enums) {
+    (void)pair;
+  }
+
+  for (const auto &pair : registry.typedefs) {
+    visit(pair.second.target);
+  }
+
+  return refs;
+}
+
 std::string render_type(const TypeRegistry &registry,
                         const CTypePtr &type_ref,
                         const std::string &name,
@@ -100,8 +142,15 @@ std::string render_type(const TypeRegistry &registry,
       inner = quals.empty() ? "*" : "* " + quals;
     }
 
-    if (resolved->target && resolved->target->needs_parens()) {
-      inner = "(" + inner + ")";
+    if (resolved->target) {
+      CTypePtr target_for_parens = resolved->target;
+      if (expand_typedefs) {
+        std::unordered_set<std::string> seen;
+        target_for_parens = resolve_typedef(registry, target_for_parens, seen);
+      }
+      if (target_for_parens && target_for_parens->needs_parens()) {
+        inner = "(" + inner + ")";
+      }
     }
     CTypePtr target = resolved->target ? resolved->target : make_named("void", "base");
     return render_type(registry, target, inner, expand_typedefs);
@@ -148,6 +197,55 @@ static std::set<KindNameKey> collect_value_deps(const TypeRegistry &registry, co
   return deps;
 }
 
+static void collect_decl_deps(const TypeRegistry &registry,
+                              const StructDecl &decl,
+                              std::set<KindNameKey> &refs,
+                              std::set<InlineKey> &seen_inline) {
+  for (const auto &member : decl.members) {
+    InlineKey inline_union_key{decl.kind, decl.name, member.name};
+    auto inline_union = registry.inline_unions.find(inline_union_key);
+    if (inline_union != registry.inline_unions.end()) {
+      const StructDecl &union_decl = inline_union->second;
+      if (!union_decl.name.empty()) {
+        refs.insert({union_decl.kind, union_decl.name});
+      }
+      for (const auto &submember : union_decl.members) {
+        InlineKey inline_member_key{union_decl.kind, union_decl.name, submember.name};
+        auto inline_member = registry.inline_members.find(inline_member_key);
+        if (inline_member != registry.inline_members.end()) {
+          if (seen_inline.insert(inline_member_key).second) {
+            collect_decl_deps(registry, inline_member->second, refs, seen_inline);
+          }
+          continue;
+        }
+        InlineKey nested_union_key{union_decl.kind, union_decl.name, submember.name};
+        auto nested_union = registry.inline_unions.find(nested_union_key);
+        if (nested_union != registry.inline_unions.end()) {
+          if (seen_inline.insert(nested_union_key).second) {
+            collect_decl_deps(registry, nested_union->second, refs, seen_inline);
+          }
+          continue;
+        }
+        auto subdeps = collect_value_deps(registry, submember.type_ref);
+        refs.insert(subdeps.begin(), subdeps.end());
+      }
+      continue;
+    }
+
+    InlineKey inline_member_key{decl.kind, decl.name, member.name};
+    auto inline_member = registry.inline_members.find(inline_member_key);
+    if (inline_member != registry.inline_members.end()) {
+      if (seen_inline.insert(inline_member_key).second) {
+        collect_decl_deps(registry, inline_member->second, refs, seen_inline);
+      }
+      continue;
+    }
+
+    auto subdeps = collect_value_deps(registry, member.type_ref);
+    refs.insert(subdeps.begin(), subdeps.end());
+  }
+}
+
 static std::vector<KindNameKey> sorted_decl_keys(const TypeRegistry &registry) {
   std::map<KindNameKey, bool> decls;
   for (const auto &pair : registry.structs) {
@@ -171,28 +269,8 @@ static std::vector<KindNameKey> sorted_decl_keys(const TypeRegistry &registry) {
       continue;
     }
     std::set<KindNameKey> refs;
-    for (const auto &member : decl.members) {
-      InlineKey inline_union_key{decl.kind, decl.name, member.name};
-      auto inline_union = registry.inline_unions.find(inline_union_key);
-      if (inline_union != registry.inline_unions.end()) {
-        for (const auto &submember : inline_union->second.members) {
-          auto subdeps = collect_value_deps(registry, submember.type_ref);
-          refs.insert(subdeps.begin(), subdeps.end());
-        }
-        continue;
-      }
-      InlineKey inline_member_key{decl.kind, decl.name, member.name};
-      auto inline_member = registry.inline_members.find(inline_member_key);
-      if (inline_member != registry.inline_members.end()) {
-        for (const auto &submember : inline_member->second.members) {
-          auto subdeps = collect_value_deps(registry, submember.type_ref);
-          refs.insert(subdeps.begin(), subdeps.end());
-        }
-        continue;
-      }
-      auto subdeps = collect_value_deps(registry, member.type_ref);
-      refs.insert(subdeps.begin(), subdeps.end());
-    }
+    std::set<InlineKey> seen_inline;
+    collect_decl_deps(registry, decl, refs, seen_inline);
     std::set<KindNameKey> filtered;
     for (const auto &ref : refs) {
       if (decls.count(ref)) {
@@ -263,6 +341,41 @@ std::string render_c(const TypeRegistry &registry) {
     lines.emplace_back("");
   }
 
+  auto pack_value = [](const StructDecl &decl) -> std::optional<int64_t> {
+    if (decl.pack && *decl.pack > 1) {
+      return decl.pack;
+    }
+    return std::nullopt;
+  };
+  auto pack_push = [&](int indent, const StructDecl &decl) -> std::string {
+    auto value = pack_value(decl);
+    if (!value) {
+      return "";
+    }
+    return std::string(indent, ' ') + "#pragma pack(push, " + std::to_string(*value) + ")";
+  };
+  auto pack_pop = [&](int indent, const StructDecl &decl) -> std::string {
+    if (!pack_value(decl)) {
+      return "";
+    }
+    return std::string(indent, ' ') + "#pragma pack(pop)";
+  };
+  auto packed_suffix_for = [&](const StructDecl &decl) -> std::string {
+    if (pack_value(decl)) {
+      return "";
+    }
+    return decl.packed ? " __attribute__((packed))" : "";
+  };
+  auto align_suffix_for = [&](const StructDecl &decl) -> std::string {
+    if (pack_value(decl)) {
+      return "";
+    }
+    if (decl.alignment) {
+      return " __attribute__((aligned(" + std::to_string(*decl.alignment) + ")))";
+    }
+    return "";
+  };
+
   std::set<std::string> suppressed_unions;
   for (const auto &pair : registry.inline_unions) {
     if (pair.second.kind == "union") {
@@ -277,15 +390,17 @@ std::string render_c(const TypeRegistry &registry) {
     }
   }
 
+  std::set<KindNameKey> referenced = collect_named_refs(registry);
+
   auto order = sorted_decl_keys(registry);
   for (const auto &key : order) {
     const std::string &kind = key.kind;
     const std::string &name = key.name;
 
-    if (kind == "union" && suppressed_unions.count(name)) {
+    if (kind == "union" && suppressed_unions.count(name) && !referenced.count({kind, name})) {
       continue;
     }
-    if (kind == "struct" && suppressed_structs.count(name)) {
+    if (kind == "struct" && suppressed_structs.count(name) && !referenced.count({kind, name})) {
       continue;
     }
     if (kind == "enum") {
@@ -319,6 +434,9 @@ std::string render_c(const TypeRegistry &registry) {
       continue;
     }
 
+    if (auto pack_line = pack_push(0, decl); !pack_line.empty()) {
+      lines.emplace_back(pack_line);
+    }
     lines.emplace_back(decl.kind + " " + decl.name + " {");
     std::vector<std::pair<std::string, int64_t>> extra_asserts;
     std::set<std::string> skip_members;
@@ -329,7 +447,7 @@ std::string render_c(const TypeRegistry &registry) {
       if (inline_union != registry.inline_unions.end()) {
         std::string align_suffix;
         std::optional<int64_t> align_value = member.alignment;
-        if (inline_union->second.alignment) {
+        if (!pack_value(inline_union->second) && inline_union->second.alignment) {
           if (!align_value || *inline_union->second.alignment > *align_value) {
             align_value = inline_union->second.alignment;
           }
@@ -337,8 +455,11 @@ std::string render_c(const TypeRegistry &registry) {
         if (align_value) {
           align_suffix = " __attribute__((aligned(" + std::to_string(*align_value) + ")))";
         }
-        std::string packed_suffix = inline_union->second.packed ? " __attribute__((packed))" : "";
+        std::string packed_suffix = packed_suffix_for(inline_union->second);
         skip_members.insert(member.name);
+        if (auto pack_line = pack_push(4, inline_union->second); !pack_line.empty()) {
+          lines.emplace_back(pack_line);
+        }
         lines.emplace_back("    union {");
         for (const auto &submember : inline_union->second.members) {
           InlineKey inline_decl_key{inline_union->second.kind, inline_union->second.name, submember.name};
@@ -404,6 +525,9 @@ std::string render_c(const TypeRegistry &registry) {
           }
         }
         lines.emplace_back("    }" + packed_suffix + align_suffix + ";");
+        if (auto pack_line = pack_pop(4, inline_union->second); !pack_line.empty()) {
+          lines.emplace_back(pack_line);
+        }
         continue;
       }
 
@@ -413,7 +537,7 @@ std::string render_c(const TypeRegistry &registry) {
         const StructDecl &nested_decl = inline_decl->second;
         std::string align_suffix;
         std::optional<int64_t> align_value = member.alignment;
-        if (nested_decl.alignment) {
+        if (!pack_value(nested_decl) && nested_decl.alignment) {
           if (!align_value || *nested_decl.alignment > *align_value) {
             align_value = nested_decl.alignment;
           }
@@ -421,7 +545,7 @@ std::string render_c(const TypeRegistry &registry) {
         if (align_value) {
           align_suffix = " __attribute__((aligned(" + std::to_string(*align_value) + ")))";
         }
-        std::string packed_suffix = nested_decl.packed ? " __attribute__((packed))" : "";
+        std::string packed_suffix = packed_suffix_for(nested_decl);
         bool emit_anonymous = (nested_decl.name_origin == "anon" || nested_decl.name_origin == "member") &&
                               is_synthetic_member_name(member.name);
         if (emit_anonymous) {
@@ -438,6 +562,9 @@ std::string render_c(const TypeRegistry &registry) {
             }
           }
         }
+        if (auto pack_line = pack_push(4, nested_decl); !pack_line.empty()) {
+          lines.emplace_back(pack_line);
+        }
         lines.emplace_back("    struct {");
         for (const auto &submember : nested_decl.members) {
           InlineKey nested_union_key{nested_decl.kind, nested_decl.name, submember.name};
@@ -447,10 +574,13 @@ std::string render_c(const TypeRegistry &registry) {
             if (submember.alignment) {
               nested_align_suffix = " __attribute__((aligned(" + std::to_string(*submember.alignment) + ")))";
             }
-            std::string nested_packed_suffix = nested_union->second.packed ? " __attribute__((packed))" : "";
+            std::string nested_packed_suffix = packed_suffix_for(nested_union->second);
             std::optional<int64_t> base_offset;
             if (member.offset && submember.offset) {
               base_offset = *member.offset + *submember.offset;
+            }
+            if (auto pack_line = pack_push(8, nested_union->second); !pack_line.empty()) {
+              lines.emplace_back(pack_line);
             }
             lines.emplace_back("        union {");
             for (const auto &union_member : nested_union->second.members) {
@@ -517,6 +647,110 @@ std::string render_c(const TypeRegistry &registry) {
               }
             }
             lines.emplace_back("        }" + nested_packed_suffix + nested_align_suffix + ";");
+            if (auto pack_line = pack_pop(8, nested_union->second); !pack_line.empty()) {
+              lines.emplace_back(pack_line);
+            }
+            continue;
+          }
+
+          bool fallback_inlined_union = false;
+          if (is_synthetic_member_name(submember.name) && !submember.bit_size) {
+            std::unordered_set<std::string> seen;
+            CTypePtr resolved_union = resolve_typedef(registry, submember.type_ref, seen);
+            if (resolved_union && resolved_union->kind == TypeKind::Named &&
+                resolved_union->ref_kind == "union" && !resolved_union->name.empty()) {
+              auto union_it = registry.structs.find({resolved_union->ref_kind, resolved_union->name});
+              if (union_it != registry.structs.end()) {
+                const StructDecl &union_decl = union_it->second;
+                if (!union_decl.opaque &&
+                    (union_decl.name_origin == "anon" || union_decl.name_origin == "member")) {
+                  std::string nested_align_suffix;
+                  if (submember.alignment) {
+                    nested_align_suffix = " __attribute__((aligned(" + std::to_string(*submember.alignment) + ")))";
+                  }
+                  std::string nested_packed_suffix = packed_suffix_for(union_decl);
+                  std::optional<int64_t> base_offset;
+                  if (member.offset && submember.offset) {
+                    base_offset = *member.offset + *submember.offset;
+                  }
+                  if (auto pack_line = pack_push(8, union_decl); !pack_line.empty()) {
+                    lines.emplace_back(pack_line);
+                  }
+                  lines.emplace_back("        union {");
+                  for (const auto &union_member : union_decl.members) {
+                    InlineKey union_inline_key{union_decl.kind, union_decl.name, union_member.name};
+                    auto union_inline_decl = registry.inline_members.find(union_inline_key);
+                    if (union_inline_decl != registry.inline_members.end()) {
+                      const StructDecl &union_struct = union_inline_decl->second;
+                      bool emit_union_anonymous =
+                          (union_struct.name_origin == "anon" || union_struct.name_origin == "member") &&
+                          is_synthetic_member_name(union_member.name);
+                      if (emit_anonymous && base_offset && union_member.offset) {
+                        if (emit_union_anonymous) {
+                          for (const auto &inline_member : union_struct.members) {
+                            if (!inline_member.offset || inline_member.bit_size) {
+                              continue;
+                            }
+                            extra_asserts.emplace_back(
+                                inline_member.name,
+                                *base_offset + *union_member.offset + *inline_member.offset);
+                          }
+                        } else {
+                          extra_asserts.emplace_back(union_member.name, *base_offset + *union_member.offset);
+                        }
+                      }
+                      lines.emplace_back("            struct {");
+                      for (const auto &inline_member : union_struct.members) {
+                        if (inline_member.bit_size) {
+                          std::string decl_text = render_type(registry, inline_member.type_ref, inline_member.name, true);
+                          if (inline_member.bit_offset) {
+                            lines.emplace_back("                " + decl_text + " : " +
+                                               std::to_string(*inline_member.bit_size) +
+                                               "; /* bit offset " + std::to_string(*inline_member.bit_offset) + " */");
+                          } else {
+                            lines.emplace_back("                " + decl_text + " : " +
+                                               std::to_string(*inline_member.bit_size) + ";");
+                          }
+                        } else {
+                          std::string decl_text = render_type(registry, inline_member.type_ref, inline_member.name, true);
+                          lines.emplace_back("                " + decl_text + ";");
+                        }
+                      }
+                      if (emit_union_anonymous) {
+                        lines.emplace_back("            };");
+                      } else {
+                        lines.emplace_back("            } " + union_member.name + ";");
+                      }
+                      continue;
+                    }
+
+                    if (emit_anonymous && base_offset && union_member.offset && !union_member.bit_size) {
+                      extra_asserts.emplace_back(union_member.name, *base_offset + *union_member.offset);
+                    }
+                    if (union_member.bit_size) {
+                      std::string decl_text = render_type(registry, union_member.type_ref, union_member.name, true);
+                      if (union_member.bit_offset) {
+                        lines.emplace_back("            " + decl_text + " : " +
+                                           std::to_string(*union_member.bit_size) +
+                                           "; /* bit offset " + std::to_string(*union_member.bit_offset) + " */");
+                      } else {
+                        lines.emplace_back("            " + decl_text + " : " + std::to_string(*union_member.bit_size) + ";");
+                      }
+                    } else {
+                      std::string decl_text = render_type(registry, union_member.type_ref, union_member.name, true);
+                      lines.emplace_back("            " + decl_text + ";");
+                    }
+                  }
+                  lines.emplace_back("        }" + nested_packed_suffix + nested_align_suffix + ";");
+                  if (auto pack_line = pack_pop(8, union_decl); !pack_line.empty()) {
+                    lines.emplace_back(pack_line);
+                  }
+                  fallback_inlined_union = true;
+                }
+              }
+            }
+          }
+          if (fallback_inlined_union) {
             continue;
           }
 
@@ -577,6 +811,9 @@ std::string render_c(const TypeRegistry &registry) {
         } else {
           lines.emplace_back("    }" + packed_suffix + " " + member.name + align_suffix + ";");
         }
+        if (auto pack_line = pack_pop(4, nested_decl); !pack_line.empty()) {
+          lines.emplace_back(pack_line);
+        }
         continue;
       }
 
@@ -599,12 +836,12 @@ std::string render_c(const TypeRegistry &registry) {
       }
     }
 
-    std::string packed_suffix = decl.packed ? " __attribute__((packed))" : "";
-    std::string align_suffix;
-    if (decl.alignment) {
-      align_suffix = " __attribute__((aligned(" + std::to_string(*decl.alignment) + ")))";
-    }
+    std::string packed_suffix = packed_suffix_for(decl);
+    std::string align_suffix = align_suffix_for(decl);
     lines.emplace_back("}" + packed_suffix + align_suffix + ";");
+    if (auto pack_line = pack_pop(0, decl); !pack_line.empty()) {
+      lines.emplace_back(pack_line);
+    }
 
     std::string type_name = decl.kind + " " + decl.name;
     for (const auto &member : decl.members) {

@@ -86,7 +86,7 @@ static void prune_unused_synthetic(TypeRegistry &registry, const CorrectionLog &
 
 static void apply_xnu_struct_group_name(TypeRegistry &registry, const CorrectionLog &log) {
   std::map<KindNameKey, std::pair<CTypePtr, std::string>> collapse;
-  std::unordered_map<std::string, std::string> cache;
+  std::unordered_map<std::string, TypeSignature> cache;
 
   auto log_msg = [&](const std::string &msg) {
     if (log) {
@@ -115,7 +115,7 @@ static void apply_xnu_struct_group_name(TypeRegistry &registry, const Correction
       continue;
     }
 
-    std::vector<std::string> sigs;
+    std::vector<TypeSignature> sigs;
     for (const auto &member : union_decl.members) {
       std::unordered_set<std::string> stack;
       sigs.push_back(normalized_type_signature(registry, member.type_ref, cache, stack, true, false));
@@ -135,7 +135,7 @@ static void apply_xnu_struct_group_name(TypeRegistry &registry, const Correction
           if (!details.empty()) {
             details += ", ";
           }
-          details += union_decl.members[i].name + ":" + sig_digest(sigs[i]);
+          details += union_decl.members[i].name + ":" + signature_digest(sigs[i]);
         }
         log_msg("skip union " + key.name + ": member types differ (" + details + ")");
       } else {
@@ -731,6 +731,9 @@ static std::optional<int64_t> type_alignment(const TypeRegistry &registry, const
         }
       }
       current_seen.erase(key);
+      if (decl.pack && *decl.pack > 1 && *decl.pack < max_align) {
+        max_align = *decl.pack;
+      }
       return max_align;
     }
     return std::nullopt;
@@ -809,6 +812,94 @@ struct_layout_matches(const TypeRegistry &registry, const StructDecl &decl, bool
   int64_t struct_align = packed ? 1 : max_align;
   int64_t size = align_up(offset, struct_align);
   return {true, size};
+}
+
+static std::optional<int64_t> infer_alignment_for_offset(int64_t cursor,
+                                                         int64_t offset,
+                                                         int64_t min_align,
+                                                         std::optional<int64_t> pack) {
+  if (offset < cursor) {
+    return std::nullopt;
+  }
+  int64_t limit = pack && *pack > 1 ? *pack : 64;
+  int64_t align = std::max<int64_t>(1, min_align);
+  for (; align <= limit; align <<= 1) {
+    if (align_up(cursor, align) == offset) {
+      return align;
+    }
+  }
+  return std::nullopt;
+}
+
+static void apply_pack_from_alignment(TypeRegistry &registry, const CorrectionLog &log) {
+  for (auto &pair : registry.structs) {
+    StructDecl &decl = pair.second;
+    if (decl.kind != "struct" || decl.opaque || decl.packed || !decl.alignment) {
+      continue;
+    }
+    auto [max_align, unknown] = max_member_alignment(registry, decl);
+    (void)unknown;
+    if (!max_align) {
+      continue;
+    }
+    if (*decl.alignment > 1 && *decl.alignment < *max_align) {
+      decl.pack = decl.alignment;
+      decl.alignment.reset();
+      if (log) {
+        log("pack struct " + decl.name + " to alignment " + std::to_string(*decl.pack));
+      }
+    }
+  }
+}
+
+static void apply_infer_member_alignment(TypeRegistry &registry, const CorrectionLog &log) {
+  for (auto &pair : registry.structs) {
+    StructDecl &decl = pair.second;
+    if (decl.kind != "struct" || decl.opaque) {
+      continue;
+    }
+    bool has_bits = false;
+    for (const auto &member : decl.members) {
+      if (member.bit_size) {
+        has_bits = true;
+        break;
+      }
+    }
+    if (has_bits) {
+      continue;
+    }
+    int64_t cursor = 0;
+    for (auto &member : decl.members) {
+      if (!member.offset || member.bit_size) {
+        continue;
+      }
+      auto size = type_size(registry, member.type_ref);
+      auto align = type_alignment(registry, member.type_ref, nullptr);
+      if (!size || !align) {
+        continue;
+      }
+      if (member.alignment && *member.alignment > *align) {
+        align = member.alignment;
+      }
+      if (decl.pack && *decl.pack > 1 && *align > *decl.pack) {
+        align = decl.pack;
+      }
+      int64_t aligned_offset = align_up(cursor, *align);
+      if (aligned_offset != *member.offset) {
+        auto inferred = infer_alignment_for_offset(cursor, *member.offset, *align, decl.pack);
+        if (inferred && (!member.alignment || *inferred > *member.alignment)) {
+          member.alignment = inferred;
+          if (log) {
+            log("align member " + decl.name + "." + member.name + " to " +
+                std::to_string(*inferred));
+          }
+          align = inferred;
+          aligned_offset = *member.offset;
+        }
+      }
+      cursor = aligned_offset + *size;
+    }
+  }
 }
 
 static void apply_infer_packed_structs(TypeRegistry &registry, const CorrectionLog &log) {
@@ -891,7 +982,7 @@ static void apply_infer_packed_structs(TypeRegistry &registry, const CorrectionL
     visiting.erase(key);
     visited.insert(key);
 
-    if (decl.opaque || decl.packed) {
+    if (decl.opaque || decl.packed || decl.pack) {
       return;
     }
     if (decl.kind != "struct") {
@@ -999,6 +1090,8 @@ void apply_corrections(TypeRegistry &registry,
       {"xnu-list-entry-inline", apply_xnu_list_entry_inline},
       {"xnu-anon-union-inline", apply_xnu_anonymous_union_inline},
       {"inline-anon-structs", apply_inline_anonymous_structs},
+      {"pack-from-alignment", apply_pack_from_alignment},
+      {"infer-member-alignment", apply_infer_member_alignment},
       {"infer-packed-structs", apply_infer_packed_structs},
   };
 

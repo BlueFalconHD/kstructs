@@ -106,20 +106,37 @@ void apply_type_prefix(TypeRegistry &registry, const std::string &prefix_input) 
   }
   registry.structs = std::move(new_structs);
 
+  std::map<InlineKey, StructDecl> new_inline_members;
   for (auto &pair : registry.inline_members) {
-    StructDecl &decl = pair.second;
-    auto it = renames.find({decl.kind, decl.name});
-    if (it != renames.end()) {
-      decl.name = it->second;
+    InlineKey key = pair.first;
+    auto key_it = renames.find({key.kind, key.name});
+    if (key_it != renames.end()) {
+      key.name = key_it->second;
     }
+    StructDecl decl = pair.second;
+    auto decl_it = renames.find({decl.kind, decl.name});
+    if (decl_it != renames.end()) {
+      decl.name = decl_it->second;
+    }
+    new_inline_members[key] = decl;
   }
+  registry.inline_members = std::move(new_inline_members);
+
+  std::map<InlineKey, StructDecl> new_inline_unions;
   for (auto &pair : registry.inline_unions) {
-    StructDecl &decl = pair.second;
-    auto it = renames.find({decl.kind, decl.name});
-    if (it != renames.end()) {
-      decl.name = it->second;
+    InlineKey key = pair.first;
+    auto key_it = renames.find({key.kind, key.name});
+    if (key_it != renames.end()) {
+      key.name = key_it->second;
     }
+    StructDecl decl = pair.second;
+    auto decl_it = renames.find({decl.kind, decl.name});
+    if (decl_it != renames.end()) {
+      decl.name = decl_it->second;
+    }
+    new_inline_unions[key] = decl;
   }
+  registry.inline_unions = std::move(new_inline_unions);
 
   std::map<std::string, EnumDecl> new_enums;
   for (auto &pair : registry.enums) {
@@ -146,32 +163,6 @@ void apply_type_prefix(TypeRegistry &registry, const std::string &prefix_input) 
     new_typedefs[name] = decl;
   }
   registry.typedefs = std::move(new_typedefs);
-
-  std::map<InlineKey, StructDecl> new_inline_members;
-  for (auto &pair : registry.inline_members) {
-    InlineKey key = pair.first;
-    auto it = renames.find({key.kind, key.name});
-    if (it != renames.end()) {
-      key.name = it->second;
-    } else {
-      key.name = prefix + key.name;
-    }
-    new_inline_members[key] = pair.second;
-  }
-  registry.inline_members = std::move(new_inline_members);
-
-  std::map<InlineKey, StructDecl> new_inline_unions;
-  for (auto &pair : registry.inline_unions) {
-    InlineKey key = pair.first;
-    auto it = renames.find({key.kind, key.name});
-    if (it != renames.end()) {
-      key.name = it->second;
-    } else {
-      key.name = prefix + key.name;
-    }
-    new_inline_unions[key] = pair.second;
-  }
-  registry.inline_unions = std::move(new_inline_unions);
 }
 
 } // namespace kstructs

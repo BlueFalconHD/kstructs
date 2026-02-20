@@ -34,6 +34,8 @@ private:
   std::set<std::pair<std::string, std::string>> expanding_;
   std::unordered_map<uint64_t, std::pair<std::string, std::string>> anon_name_overrides_;
   std::map<std::pair<std::string, std::string>, uint64_t> name_owner_;
+  std::unordered_map<uint64_t, std::pair<std::string, std::string>> die_assigned_names_;
+  TypeFactory type_factory_;
 
   void log_null_member(const std::string &struct_name, const std::string &member_name, const std::string &message);
 
@@ -45,7 +47,8 @@ private:
   llvm::DWARFDie canonical_die(const llvm::DWARFDie &die);
   std::optional<std::string> die_name(const llvm::DWARFDie &die) const;
   std::string anon_type_name(const std::string &kind);
-  std::string assign_name(const std::string &kind, const std::string &base, const llvm::DWARFDie &die);
+  std::string assign_name(const std::string &kind, const std::string &base, const llvm::DWARFDie &die,
+                          std::string *name_origin);
 
   CTypePtr build_type_ref(const llvm::DWARFDie &die, int depth, const std::optional<std::string> &suggested_name);
   CTypePtr build_struct_union(const llvm::DWARFDie &die, int depth, const std::optional<std::string> &suggested_name);
@@ -54,7 +57,7 @@ private:
   CTypePtr apply_qualifier(const CTypePtr &type_ref, const std::string &qualifier);
 
   bool is_void_type(const CTypePtr &type_ref) const;
-  CTypePtr opaque_type_for_size(int64_t size) const;
+  CTypePtr opaque_type_for_size(int64_t size);
   std::optional<int64_t> member_offset(const llvm::DWARFDie &member_die, const std::string &parent_kind) const;
 };
 

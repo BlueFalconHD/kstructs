@@ -2,77 +2,173 @@
 
 #include "dwarf_utils.h"
 
-#include <sstream>
+#include <string>
+
+#include <llvm/ADT/ArrayRef.h>
+#include <llvm/ADT/StringExtras.h>
+#include <llvm/Support/SHA1.h>
 
 namespace kstructs {
 
-static std::string opt_int(const std::optional<int64_t> &value) {
-  if (value) {
-    return std::to_string(*value);
-  }
-  return "null";
-}
+namespace {
+struct SigHasher {
+  llvm::SHA1 sha;
 
-static std::string join_qualifiers(const std::vector<std::string> &quals) {
-  if (quals.empty()) {
-    return "";
+  void mix_bytes(const uint8_t *data, size_t size) {
+    sha.update(llvm::ArrayRef<uint8_t>(data, size));
   }
-  std::ostringstream oss;
-  bool first = true;
-  for (const auto &q : quals) {
-    if (!first) {
-      oss << ",";
+
+  void mix_byte(uint8_t byte) { mix_bytes(&byte, 1); }
+
+  void mix_u64(uint64_t value) {
+    uint8_t bytes[8];
+    for (int i = 0; i < 8; ++i) {
+      bytes[i] = static_cast<uint8_t>((value >> (i * 8)) & 0xFF);
     }
-    first = false;
-    oss << q;
+    mix_bytes(bytes, sizeof(bytes));
   }
-  return oss.str();
+
+  void mix_i64(int64_t value) { mix_u64(static_cast<uint64_t>(value)); }
+
+  void mix_bool(bool value) { mix_byte(value ? 1 : 0); }
+
+  void mix_str(const std::string &value) {
+    mix_u64(static_cast<uint64_t>(value.size()));
+    if (!value.empty()) {
+      mix_bytes(reinterpret_cast<const uint8_t *>(value.data()), value.size());
+    }
+  }
+
+  void mix_sig(const TypeSignature &sig) {
+    mix_bytes(sig.bytes.data(), sig.bytes.size());
+  }
+
+  TypeSignature finish() {
+    TypeSignature out;
+    out.bytes = sha.final();
+    return out;
+  }
+};
+
+void mix_optional_i64(SigHasher &hasher, const std::optional<int64_t> &value) {
+  hasher.mix_bool(value.has_value());
+  if (value) {
+    hasher.mix_i64(*value);
+  }
 }
 
-static std::string struct_signature_with(
+void mix_qualifiers(SigHasher &hasher, const std::vector<std::string> &quals) {
+  hasher.mix_u64(static_cast<uint64_t>(quals.size()));
+  for (const auto &q : quals) {
+    hasher.mix_str(q);
+  }
+}
+
+TypeSignature signature_named(const std::string &ref_kind, const std::string &name,
+                              const std::vector<std::string> &qualifiers) {
+  SigHasher hasher;
+  hasher.mix_byte('N');
+  hasher.mix_str(ref_kind);
+  hasher.mix_str(name);
+  mix_qualifiers(hasher, qualifiers);
+  return hasher.finish();
+}
+
+TypeSignature signature_rec(const std::string &ref_kind, const std::string &name,
+                            const std::vector<std::string> &qualifiers) {
+  SigHasher hasher;
+  hasher.mix_byte('R');
+  hasher.mix_str(ref_kind);
+  hasher.mix_str(name);
+  mix_qualifiers(hasher, qualifiers);
+  return hasher.finish();
+}
+
+TypeSignature signature_pointer(const TypeSignature &target) {
+  SigHasher hasher;
+  hasher.mix_byte('P');
+  hasher.mix_sig(target);
+  return hasher.finish();
+}
+
+TypeSignature signature_array(const TypeSignature &target, const std::optional<int64_t> &count) {
+  SigHasher hasher;
+  hasher.mix_byte('A');
+  mix_optional_i64(hasher, count);
+  hasher.mix_sig(target);
+  return hasher.finish();
+}
+
+TypeSignature signature_unknown() {
+  SigHasher hasher;
+  hasher.mix_byte('U');
+  return hasher.finish();
+}
+
+TypeSignature signature_layout(const std::string &kind,
+                               const TypeSignature &struct_sig,
+                               const std::vector<std::string> &qualifiers) {
+  SigHasher hasher;
+  hasher.mix_byte('L');
+  hasher.mix_str(kind);
+  hasher.mix_sig(struct_sig);
+  mix_qualifiers(hasher, qualifiers);
+  return hasher.finish();
+}
+
+TypeSignature struct_signature_with(
     const TypeRegistry &registry,
     const StructDecl &decl,
-    const std::function<std::string(const CTypePtr &)> &type_sig_fn,
+    const std::function<TypeSignature(const CTypePtr &)> &type_sig_fn,
     bool include_member_names) {
-  std::ostringstream oss;
-  oss << "struct(" << decl.kind << "," << opt_int(decl.size) << ",[";
-  bool first = true;
+  SigHasher hasher;
+  hasher.mix_byte('S');
+  hasher.mix_str(decl.kind);
+  mix_optional_i64(hasher, decl.size);
   for (const auto &member : decl.members) {
-    if (!first) {
-      oss << ",";
-    }
-    first = false;
-    oss << "(";
+    hasher.mix_byte('M');
     if (include_member_names) {
-      oss << member.name;
+      hasher.mix_str(member.name);
     } else {
-      oss << "_";
+      hasher.mix_str("_");
     }
-    oss << "," << type_sig_fn(member.type_ref);
-    oss << "," << opt_int(member.offset);
-    oss << "," << opt_int(member.bit_size);
-    oss << "," << opt_int(member.bit_offset);
-    oss << ")";
+    hasher.mix_sig(type_sig_fn(member.type_ref));
+    mix_optional_i64(hasher, member.offset);
+    mix_optional_i64(hasher, member.bit_size);
+    mix_optional_i64(hasher, member.bit_offset);
   }
-  oss << "])";
-  return oss.str();
+  return hasher.finish();
 }
 
-std::string normalized_type_signature(
+} // namespace
+
+std::string signature_hex(const TypeSignature &sig) {
+  llvm::ArrayRef<uint8_t> bytes(sig.bytes.data(), sig.bytes.size());
+  return llvm::toHex(bytes, true);
+}
+
+std::string signature_digest(const TypeSignature &sig) {
+  std::string hex = signature_hex(sig);
+  if (hex.size() <= 8) {
+    return hex;
+  }
+  return hex.substr(0, 8);
+}
+
+TypeSignature normalized_type_signature(
     const TypeRegistry &registry,
     const CTypePtr &type_ref,
-    std::unordered_map<std::string, std::string> &cache,
+    std::unordered_map<std::string, TypeSignature> &cache,
     std::unordered_set<std::string> &stack,
     bool layout_for_named,
     bool include_member_names) {
   std::unordered_set<std::string> seen;
   CTypePtr resolved = resolve_typedef(registry, type_ref, seen);
   if (!resolved) {
-    return "unknown";
+    return signature_unknown();
   }
 
   if (resolved->kind == TypeKind::Named) {
-    std::string qualifiers = join_qualifiers(resolved->qualifiers);
     if ((resolved->ref_kind == "struct" || resolved->ref_kind == "union") &&
         !resolved->name.empty()) {
       KindNameKey key{resolved->ref_kind, resolved->name};
@@ -89,10 +185,10 @@ std::string normalized_type_signature(
           }
           std::string stack_key = resolved->ref_kind + "|" + resolved->name;
           if (stack.count(stack_key)) {
-            return "rec|" + resolved->ref_kind + "|" + resolved->name + "|" + qualifiers;
+            return signature_rec(resolved->ref_kind, resolved->name, resolved->qualifiers);
           }
           stack.insert(stack_key);
-          std::string sig = struct_signature_with(
+          TypeSignature sig = struct_signature_with(
               registry,
               decl,
               [&](const CTypePtr &ref) {
@@ -101,30 +197,32 @@ std::string normalized_type_signature(
               },
               include_member_names);
           stack.erase(stack_key);
-          std::string out = "layout|" + resolved->ref_kind + "|" + sig + "|" + qualifiers;
+          TypeSignature out = signature_layout(resolved->ref_kind, sig, resolved->qualifiers);
           cache[cache_key] = out;
           return out;
         }
       }
     }
-    return "named|" + resolved->ref_kind + "|" + resolved->name + "|" + qualifiers;
+    return signature_named(resolved->ref_kind, resolved->name, resolved->qualifiers);
   }
 
   if (resolved->kind == TypeKind::Pointer) {
-    CTypePtr target = resolved->target ? resolved->target : make_named("void", "base");
-    return "ptr|" + normalized_type_signature(registry, target, cache, stack,
-                                              layout_for_named, include_member_names);
+    TypeSignature target = resolved->target
+                               ? normalized_type_signature(registry, resolved->target, cache, stack,
+                                                           layout_for_named, include_member_names)
+                               : signature_named("base", "void", {});
+    return signature_pointer(target);
   }
 
   if (resolved->kind == TypeKind::Array) {
-    CTypePtr target = resolved->target ? resolved->target : make_named("void", "base");
-    std::string count = resolved->count ? std::to_string(*resolved->count) : "null";
-    return "arr|" + count + "|" +
-           normalized_type_signature(registry, target, cache, stack,
-                                     layout_for_named, include_member_names);
+    TypeSignature target = resolved->target
+                               ? normalized_type_signature(registry, resolved->target, cache, stack,
+                                                           layout_for_named, include_member_names)
+                               : signature_named("base", "void", {});
+    return signature_array(target, resolved->count);
   }
 
-  return "unknown";
+  return signature_unknown();
 }
 
 } // namespace kstructs

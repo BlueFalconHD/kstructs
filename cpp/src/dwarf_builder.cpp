@@ -208,15 +208,28 @@ std::string TypeBuilder::anon_type_name(const std::string &kind) {
   return "__anon_" + kind + "_" + std::to_string(anon_type_counter_);
 }
 
-std::string TypeBuilder::assign_name(const std::string &kind, const std::string &base, const llvm::DWARFDie &die) {
+std::string TypeBuilder::assign_name(const std::string &kind, const std::string &base, const llvm::DWARFDie &die,
+                                     std::string *name_origin) {
+  auto cached = die_assigned_names_.find(die.getOffset());
+  if (cached != die_assigned_names_.end()) {
+    if (name_origin) {
+      *name_origin = cached->second.second;
+    }
+    return cached->second.first;
+  }
   std::string sanitized = sanitize_identifier(base);
   if (sanitized.empty()) {
     sanitized = anon_type_name(kind);
+  }
+  if (kind == "typedef") {
+    die_assigned_names_[die.getOffset()] = {sanitized, name_origin ? *name_origin : std::string()};
+    return sanitized;
   }
   std::pair<std::string, std::string> key{kind, sanitized};
   auto owner = name_owner_.find(key);
   if (owner == name_owner_.end() || owner->second == die.getOffset()) {
     name_owner_[key] = die.getOffset();
+    die_assigned_names_[die.getOffset()] = {sanitized, name_origin ? *name_origin : std::string()};
     return sanitized;
   }
   int idx = 2;
@@ -226,6 +239,7 @@ std::string TypeBuilder::assign_name(const std::string &kind, const std::string 
     auto it = name_owner_.find(ckey);
     if (it == name_owner_.end() || it->second == die.getOffset()) {
       name_owner_[ckey] = die.getOffset();
+      die_assigned_names_[die.getOffset()] = {candidate, name_origin ? *name_origin : std::string()};
       return candidate;
     }
     idx += 1;
@@ -289,7 +303,7 @@ CTypePtr TypeBuilder::build_from_root(const llvm::DWARFDie &root_die) {
 CTypePtr TypeBuilder::build_type_ref(const llvm::DWARFDie &die, int depth,
                                     const std::optional<std::string> &suggested_name) {
   if (!die.isValid()) {
-    return make_named("void", "base");
+    return type_factory_.named("void", "base");
   }
 
   llvm::DWARFDie current = canonical_die(die);
@@ -301,7 +315,8 @@ CTypePtr TypeBuilder::build_type_ref(const llvm::DWARFDie &die, int depth,
       llvm::DWARFDie target = current.getAttributeValueAsReferencedDie(llvm::dwarf::DW_AT_type);
       return build_type_ref(target, depth, std::nullopt);
     }
-    const std::string &name = *name_opt;
+    std::string name_origin = "typedef";
+    const std::string name = assign_name("typedef", *name_opt, current, &name_origin);
     if (registry.typedefs.find(name) == registry.typedefs.end()) {
       llvm::DWARFDie target = current.getAttributeValueAsReferencedDie(llvm::dwarf::DW_AT_type);
       if (target.isValid() && (STRUCT_TAGS.count(tag_name(target.getTag())) || tag_name(target.getTag()) == ENUM_TAG)) {
@@ -311,13 +326,13 @@ CTypePtr TypeBuilder::build_type_ref(const llvm::DWARFDie &die, int depth,
       }
       CTypePtr target_ref;
       if (!target.isValid()) {
-        target_ref = make_named("void", "base");
+        target_ref = type_factory_.named("void", "base");
       } else {
         target_ref = build_type_ref(target, depth, std::nullopt);
       }
       registry.typedefs[name] = TypedefDecl{name, target_ref};
     }
-    return make_named(name, "typedef");
+    return type_factory_.named(name, "typedef");
   }
 
   if (STRUCT_TAGS.count(tag)) {
@@ -338,7 +353,7 @@ CTypePtr TypeBuilder::build_type_ref(const llvm::DWARFDie &die, int depth,
         }
       }
     }
-    return make_named(name, "base");
+    return type_factory_.named(name, "base");
   }
 
   if (tag == POINTER_TAG || tag == REFERENCE_TAG || tag == RV_REFERENCE_TAG) {
@@ -347,9 +362,9 @@ CTypePtr TypeBuilder::build_type_ref(const llvm::DWARFDie &die, int depth,
     if (target.isValid()) {
       target_ref = build_type_ref(target, depth + 1, std::nullopt);
     } else {
-      target_ref = make_named("void", "base");
+      target_ref = type_factory_.named("void", "base");
     }
-    return make_pointer(target_ref);
+    return type_factory_.pointer(target_ref);
   }
 
   if (tag == ARRAY_TAG) {
@@ -359,7 +374,7 @@ CTypePtr TypeBuilder::build_type_ref(const llvm::DWARFDie &die, int depth,
   if (tag == CONST_TAG || tag == VOLATILE_TAG || tag == RESTRICT_TAG || tag == ATOMIC_TAG) {
     llvm::DWARFDie target = current.getAttributeValueAsReferencedDie(llvm::dwarf::DW_AT_type);
     CTypePtr target_ref = target.isValid() ? build_type_ref(target, depth, suggested_name)
-                                           : make_named("void", "base");
+                                           : type_factory_.named("void", "base");
     std::string qualifier;
     if (tag == CONST_TAG) {
       qualifier = "const";
@@ -381,12 +396,13 @@ CTypePtr TypeBuilder::build_type_ref(const llvm::DWARFDie &die, int depth,
   }
 
   if (tag == UNSPEC_TAG || tag == SUBROUTINE_TAG) {
-    return make_named("void", "base");
+    return type_factory_.named("void", "base");
   }
 
   auto name_opt = die_name(current);
   if (name_opt) {
-    const std::string &name = *name_opt;
+    std::string name_origin = "typedef";
+    const std::string name = assign_name("typedef", *name_opt, current, &name_origin);
     if (registry.typedefs.find(name) == registry.typedefs.end()) {
       auto size_form = current.find(llvm::dwarf::DW_AT_byte_size);
       int64_t size = 1;
@@ -398,41 +414,21 @@ CTypePtr TypeBuilder::build_type_ref(const llvm::DWARFDie &die, int depth,
       CTypePtr opaque = opaque_type_for_size(size);
       registry.typedefs[name] = TypedefDecl{name, opaque};
     }
-    return make_named(name, "typedef");
+    return type_factory_.named(name, "typedef");
   }
 
-  return make_named("void", "base");
+  return type_factory_.named("void", "base");
 }
 
 CTypePtr TypeBuilder::apply_qualifier(const CTypePtr &type_ref, const std::string &qualifier) {
-  if (!type_ref) {
-    return type_ref;
-  }
-  if (type_ref->kind == TypeKind::Named) {
-    if (std::find(type_ref->qualifiers.begin(), type_ref->qualifiers.end(), qualifier) ==
-        type_ref->qualifiers.end()) {
-      type_ref->qualifiers.insert(type_ref->qualifiers.begin(), qualifier);
-    }
-    return type_ref;
-  }
-  if (qualifier == "_Atomic" && type_ref->kind == TypeKind::Pointer) {
-    if (std::find(type_ref->qualifiers.begin(), type_ref->qualifiers.end(), qualifier) ==
-        type_ref->qualifiers.end()) {
-      type_ref->qualifiers.insert(type_ref->qualifiers.begin(), qualifier);
-    }
-    return type_ref;
-  }
-  if ((type_ref->kind == TypeKind::Pointer || type_ref->kind == TypeKind::Array) && type_ref->target) {
-    type_ref->target = apply_qualifier(type_ref->target, qualifier);
-  }
-  return type_ref;
+  return type_factory_.qualify(type_ref, qualifier);
 }
 
 CTypePtr TypeBuilder::build_array(const llvm::DWARFDie &die, int depth,
                                  const std::optional<std::string> &suggested_name) {
   llvm::DWARFDie element = die.getAttributeValueAsReferencedDie(llvm::dwarf::DW_AT_type);
   CTypePtr element_ref = element.isValid() ? build_type_ref(element, depth, suggested_name)
-                                           : make_named("uint8_t", "base");
+                                           : type_factory_.named("uint8_t", "base");
 
   std::vector<std::optional<int64_t>> counts;
   for (const auto &child : die.children()) {
@@ -460,12 +456,12 @@ CTypePtr TypeBuilder::build_array(const llvm::DWARFDie &die, int depth,
   }
 
   if (counts.empty()) {
-    return make_array(element_ref, std::nullopt);
+    return type_factory_.array(element_ref, std::nullopt);
   }
 
   CTypePtr current = element_ref;
   for (auto it = counts.rbegin(); it != counts.rend(); ++it) {
-    current = make_array(current, *it);
+    current = type_factory_.array(current, *it);
   }
   return current;
 }
@@ -491,16 +487,16 @@ CTypePtr TypeBuilder::build_struct_union(const llvm::DWARFDie &die, int depth,
       name_origin = "anon";
     }
   }
-  name = assign_name(kind, name, die);
+  name = assign_name(kind, name, die, &name_origin);
   KindNameKey key{kind, name};
 
   if (expanding_.count({kind, name})) {
-    return make_named(name, kind);
+    return type_factory_.named(name, kind);
   }
 
   auto existing = registry.structs.find(key);
   if (existing != registry.structs.end() && (!existing->second.opaque || depth > max_depth_)) {
-    return make_named(name, kind);
+    return type_factory_.named(name, kind);
   }
 
   std::optional<int64_t> size;
@@ -519,13 +515,13 @@ CTypePtr TypeBuilder::build_struct_union(const llvm::DWARFDie &die, int depth,
   }
 
   if (depth > max_depth_) {
-    registry.structs[key] = StructDecl{kind, name, size, {}, true, name_origin, false, alignment};
-    return make_named(name, kind);
+    registry.structs[key] = StructDecl{kind, name, size, {}, true, name_origin, false, std::nullopt, alignment};
+    return type_factory_.named(name, kind);
   }
 
   expanding_.insert({kind, name});
 
-  StructDecl decl{kind, name, size, {}, false, name_origin, false, alignment};
+  StructDecl decl{kind, name, size, {}, false, name_origin, false, std::nullopt, alignment};
   registry.structs[key] = decl;
 
   std::unordered_map<std::string, int> member_names;
@@ -636,27 +632,31 @@ CTypePtr TypeBuilder::build_struct_union(const llvm::DWARFDie &die, int depth,
   }
 
   expanding_.erase({kind, name});
-  return make_named(name, kind);
+  return type_factory_.named(name, kind);
 }
 
 CTypePtr TypeBuilder::build_enum(const llvm::DWARFDie &die, int depth,
                                 const std::optional<std::string> &suggested_name) {
+  std::string name_origin = "dwarf";
   std::string name = die_name(die).value_or("");
   if (name.empty()) {
     auto override = anon_name_overrides_.find(die.getOffset());
     if (override != anon_name_overrides_.end()) {
       name = override->second.first;
+      name_origin = override->second.second;
     } else if (suggested_name) {
       name = *suggested_name;
+      name_origin = "member";
     } else {
       name = anon_type_name("enum");
+      name_origin = "anon";
     }
   }
-  name = assign_name("enum", name, die);
+  name = assign_name("enum", name, die, &name_origin);
 
   auto existing = registry.enums.find(name);
   if (existing != registry.enums.end() && (!existing->second.opaque || depth > max_depth_)) {
-    return make_named(name, "enum");
+    return type_factory_.named(name, "enum");
   }
 
   std::optional<int64_t> size;
@@ -679,7 +679,7 @@ CTypePtr TypeBuilder::build_enum(const llvm::DWARFDie &die, int depth,
 
   if (depth > max_depth_) {
     registry.enums[name] = EnumDecl{name, size, {}, true, std::nullopt, underlying};
-    return make_named(name, "enum");
+    return type_factory_.named(name, "enum");
   }
 
   std::vector<std::pair<std::string, int64_t>> enumerators;
@@ -704,7 +704,7 @@ CTypePtr TypeBuilder::build_enum(const llvm::DWARFDie &die, int depth,
   }
 
   registry.enums[name] = EnumDecl{name, size, enumerators, false, std::nullopt, underlying};
-  return make_named(name, "enum");
+  return type_factory_.named(name, "enum");
 }
 
 bool TypeBuilder::is_void_type(const CTypePtr &type_ref) const {
@@ -713,23 +713,23 @@ bool TypeBuilder::is_void_type(const CTypePtr &type_ref) const {
   return resolved && resolved->kind == TypeKind::Named && resolved->name == "void";
 }
 
-CTypePtr TypeBuilder::opaque_type_for_size(int64_t size) const {
+CTypePtr TypeBuilder::opaque_type_for_size(int64_t size) {
   if (size == 1) {
-    return make_named("uint8_t", "base");
+    return type_factory_.named("uint8_t", "base");
   }
   if (size == 2) {
-    return make_named("uint16_t", "base");
+    return type_factory_.named("uint16_t", "base");
   }
   if (size == 4) {
-    return make_named("uint32_t", "base");
+    return type_factory_.named("uint32_t", "base");
   }
   if (size == 8) {
-    return make_named("uint64_t", "base");
+    return type_factory_.named("uint64_t", "base");
   }
   if (size == 16) {
-    return make_named("unsigned __int128", "base");
+    return type_factory_.named("unsigned __int128", "base");
   }
-  return make_array(make_named("uint8_t", "base"), size);
+  return type_factory_.array(type_factory_.named("uint8_t", "base"), size);
 }
 
 std::optional<int64_t> TypeBuilder::member_offset(const llvm::DWARFDie &member_die,
