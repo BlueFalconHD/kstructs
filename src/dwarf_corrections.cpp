@@ -843,7 +843,7 @@ static void apply_infer_packed_structs(TypeRegistry &registry, const CorrectionL
         ensure_struct(it->second);
         return;
       }
-      // Union: recurse into member types to pack nested structs first.
+      // recurse into member types to pack nested structs first.
       const StructDecl &union_decl = it->second;
       for (const auto &member : union_decl.members) {
         walk_type(member.type_ref);

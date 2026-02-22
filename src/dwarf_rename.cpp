@@ -147,6 +147,9 @@ void apply_type_prefix(TypeRegistry &registry, const std::string &prefix_input) 
     }
     EnumDecl decl = pair.second;
     decl.name = name;
+    for (auto &enumerator : decl.enumerators) {
+      enumerator.first = prefix + enumerator.first;
+    }
     new_enums[name] = decl;
   }
   registry.enums = std::move(new_enums);
